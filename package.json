@@ -1,0 +1,19 @@
+{
+  "name": "js-code",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm"
+    }
+  },
+  "main": "./src/app.ts",
+  "scripts": {
+    "dev": "ts-code"
+  },
+  "dependencies": {
+    "ts-code": "link:../ts-code/ts-code"
+  },
+  "devDependencies": {}
+}
