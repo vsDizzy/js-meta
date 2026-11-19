@@ -18,8 +18,8 @@
     "typescript": "6.0.3"
   },
   "ts-code": {
-    "imports": {
-      "@typescript-eslint/typescript-estree": "?bundle"
+    "esm.sh": {
+      "@typescript-eslint/typescript-estree": "bundle&external=typescript"
     }
   },
   "devDependencies": {
