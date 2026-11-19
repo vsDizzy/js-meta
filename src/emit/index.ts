@@ -3,9 +3,9 @@
 //   literals from `raw` when present, parentheses from precedence,
 //   comments as nodes: own line in statement lists, inline in expression lists.
 // Printers are plain functions `node -> string`, one per node type (PRINTERS).
-import type { Node } from '../read/index.ts'
+import { toNode, type Node } from '../ast/node.ts'
 
-// The AST is open-ended data; printers read fields by name.
+// The AST is open-ended data; printers read slots and attrs by name.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type N = any
 
@@ -20,7 +20,9 @@ const STEP = '  '
 const deeper = (ctx: Ctx): Ctx => ({ ind: ctx.ind + STEP })
 const plain = (ctx: Ctx): Ctx => ({ ind: ctx.ind })
 
-export function emit(ast: Node): string {
+/** Prints a node: a Node, a plain `{ type, ...attrs, children }` or an ESTree object. */
+export function emit(input: Node | object): string {
+  const ast = toNode(input)
   if (ast.type === 'Program') {
     const body = stmts((ast as N).body, { ind: '' })
     return body ? body + '\n' : ''
@@ -678,8 +680,8 @@ const PRINTERS: Record<string, Printer> = {
 
   // --- JSX ---
   JSXElement: (n, ctx) =>
-    print(n.openingElement, ctx) + jsxChildren(n.children, ctx) + (n.closingElement ? print(n.closingElement, ctx) : ''),
-  JSXFragment: (n, ctx) => '<>' + jsxChildren(n.children, ctx) + '</>',
+    print(n.openingElement, ctx) + jsxChildren(n.content, ctx) + (n.closingElement ? print(n.closingElement, ctx) : ''),
+  JSXFragment: (n, ctx) => '<>' + jsxChildren(n.content, ctx) + '</>',
   JSXOpeningElement(n, ctx) {
     const attrs = list(n.attributes, ctx, nodeItem, { open: '', close: '', sep: '', trailing: false })
     const name = print(n.name, ctx) + typeArgs(n.typeArguments, ctx)

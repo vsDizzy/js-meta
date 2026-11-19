@@ -101,7 +101,7 @@ describe('comments as nodes', () => {
 
   test('JSX: {/* c */} becomes a Comment child', () => {
     const el = expr('<a>x{/* c */}<b /></a>')
-    assert.deepEqual(shape(el.children), ['JSXText', '/* c */', 'JSXElement'])
+    assert.deepEqual(shape(el.content), ['JSXText', '/* c */', 'JSXElement'])
     const attrs = expr('<a /* c */ b={1} />').openingElement.attributes
     assert.deepEqual(shape(attrs), ['/* c */', 'JSXAttribute'])
   })

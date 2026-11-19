@@ -1,16 +1,14 @@
-// read(source) -> AST: ESTree (types and JSX included) as plain data, with
-// comments as `Comment` nodes in lists and positions in a side table (origin.ts).
+// read(source) -> AST: nodes `{ type, ...attrs, children }` (ast/node.ts) for
+// ESTree types and JSX included, with comments as `Comment` nodes in lists and
+// positions in a side table (ast/origin.ts).
+import { make, Node, slotsOf, type Slot } from '../ast/node.ts'
+import { setOrigin, position, type SourceFile } from '../ast/origin.ts'
 import { attachComments, childKeys, isNode } from './comments.ts'
-import { setOrigin, position, type SourceFile } from './origin.ts'
 import { ParseError, typescriptEstree, type EsNode, type Parser } from './parser.ts'
 
-export { originOf, position, type Origin, type SourceFile } from './origin.ts'
+export { originOf, position, type Origin, type SourceFile } from '../ast/origin.ts'
 export { typescriptEstree, ParseError, type Parser } from './parser.ts'
-
-export interface Node {
-  type: string
-  [key: string]: unknown
-}
+export { Node }
 
 export interface Program extends Node {
   type: 'Program'
@@ -74,21 +72,30 @@ export function read(source: string, options: ReadOptions = {}): Program {
 
 /** `{}` in JSX children: nothing but a holder for comments, which are nodes now. */
 const isEmptyJsxContainer = (value: unknown) =>
-  isNode(value) && value.type === 'JSXExpressionContainer' && (value.expression as Node).type === 'JSXEmptyExpression'
+  isNode(value) && value.type === 'JSXExpressionContainer' && (value.expression as EsNode).type === 'JSXEmptyExpression'
 
-/** Fresh plain objects, keys in parser order; `range` moves to the origin table. */
+const holdsNodes = (v: unknown) => isNode(v) || (Array.isArray(v) && v.some(isNode))
+
+/** ESTree -> nodes: slots from the table, the rest as attrs; `range` moves to the origin table. */
 function toAst(node: EsNode, file: SourceFile): Node {
-  const out: Node = { type: node.type }
-  const isJsx = node.type === 'JSXElement' || node.type === 'JSXFragment'
+  const slots = slotsOf(node.type)
+  if (!slots) throw new Error(`read: no slots for node type "${node.type}" (add it to ast/slots.ts)`)
+  const attrs: Record<string, unknown> = {}
   for (const key of childKeys(node)) {
-    let value = node[key]
-    if (Array.isArray(value)) {
-      if (isJsx && key === 'children') value = value.filter((v) => !isEmptyJsxContainer(v))
-      out[key] = (value as unknown[]).map((v) => (isNode(v) ? toAst(v, file) : v))
-    } else {
-      out[key] = isNode(value) ? toAst(value, file) : value
-    }
+    if (slots.includes(key)) continue
+    if (holdsNodes(node[key])) throw new Error(`read: ${node.type}.${key} holds nodes but is not a slot (ast/slots.ts)`)
+    attrs[key] = node[key]
   }
+  const isJsx = node.type === 'JSXElement' || node.type === 'JSXFragment'
+  const children = slots.map((key): Slot => {
+    const value = node[key]
+    if (Array.isArray(value)) {
+      const items = isJsx && key === 'children' ? value.filter((v) => !isEmptyJsxContainer(v)) : value
+      return items.map((v) => (isNode(v) ? toAst(v, file) : null))
+    }
+    return isNode(value) ? toAst(value, file) : null
+  })
+  const out = make(node.type, attrs, children)
   setOrigin(out, { file, start: node.range[0], end: node.range[1] })
   return out
 }

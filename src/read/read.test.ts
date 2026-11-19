@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
+import { toEstree } from '../ast/node.ts'
 import { originOf, read, ReadError, type Node } from './index.ts'
 
 const first = (src: string, opts?: Parameters<typeof read>[1]) => read(src, opts).body[0] as Node
@@ -96,6 +97,6 @@ describe('read', () => {
         }),
       },
     })
-    assert.deepEqual(ast.body, [{ type: 'Comment', kind: 'Line', value: ' hi' }])
+    assert.deepEqual(toEstree(ast).body, [{ type: 'Comment', kind: 'Line', value: ' hi' }])
   })
 })
