@@ -2,3 +2,5 @@
 export { read, ReadError, typescriptEstree, ParseError, type Program, type ReadOptions, type Parser } from './read/index.ts'
 export { emit, emitWithMap, type SourceMap } from './emit/index.ts'
 export * from './ast/index.ts'
+export { bootstrap, runtime, Runtime, type ModuleRecord, type Namespace, type RuntimeOptions } from './loader/runtime.ts'
+export { lower, type Lowered } from './loader/lower.ts'

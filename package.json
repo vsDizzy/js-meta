@@ -11,7 +11,7 @@
   "main": "./src/app.ts",
   "scripts": {
     "dev": "ts-code",
-    "test": "node --test \"src/**/*.test.ts\""
+    "test": "node --test --test-timeout=10000 \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@typescript-eslint/typescript-estree": "8.72.2",

@@ -1,20 +1,12 @@
-// read() + emit() on the page: same code as under node --test. ts-code maps
-// `dependencies` to esm.sh; the parser shares the page's TypeScript (external).
-import { emit, emitWithMap, read } from './index.ts'
-
-const url = new URL('./emit/index.ts', import.meta.url).href
-const source = await (await fetch(url)).text()
+// The page: boots the demo app through the js-meta runtime, then shows what it holds.
+import { bootstrap, runtime } from './index.ts'
 
 const t0 = performance.now()
-const ast = read(source, { filename: url })
+const main = await bootstrap(new URL('./demo/main.js', import.meta.url).href)
 const t1 = performance.now()
-const { code, map } = emitWithMap(ast)
-const t2 = performance.now()
 
-const same = emit(read(code, { filename: url })) === code
-const segments = map.mappings.split(/[;,]/).filter(Boolean).length
-console.log(
-  `[meta] ${url}: read ${(t1 - t0).toFixed(1)} ms, emit+map ${(t2 - t1).toFixed(1)} ms, ` +
-    `${segments} segments, ${map.names.length} names, fixed point: ${same}`,
-)
-console.log(code.split('\n').slice(0, 12).join('\n'))
+console.log(`[meta] booted in ${(t1 - t0).toFixed(1)} ms; stack from main.js: ${main.where}`)
+for (const r of runtime().records.values()) {
+  const deps = r.dependencies.map((d) => d.split('/').pop()).join(', ') || '-'
+  console.log(`[meta] ${r.kind.padEnd(6)} ${r.status.padEnd(9)} ${r.url}  deps: ${deps}`)
+}
