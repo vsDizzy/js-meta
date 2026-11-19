@@ -14,11 +14,11 @@
     "test": "node --test \"src/**/*.test.ts\""
   },
   "dependencies": {
-    "ts-code": "link:../ts-code/ts-code"
+    "@typescript-eslint/typescript-estree": "8.72.2",
+    "typescript": "6.0.3"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
-    "@typescript-eslint/typescript-estree": "8.72.2",
-    "typescript": "6.0.3"
+    "ts-code": "link:../ts-code/ts-code"
   }
 }
