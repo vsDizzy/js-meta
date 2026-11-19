@@ -1,5 +1,5 @@
-// read() + emit() on the page: same code as under node --test; the import map in
-// index.html points the parser at esm.sh, sharing one TypeScript with ts-code's SW.
+// read() + emit() on the page: same code as under node --test. ts-code maps
+// `dependencies` to esm.sh; the parser shares the page's TypeScript (external).
 import { emit } from './emit/index.ts'
 import { read } from './read/index.ts'
 
