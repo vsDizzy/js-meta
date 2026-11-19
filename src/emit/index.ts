@@ -2,42 +2,55 @@
 //   2-space indent, no semicolons (ASI-safe), no line wrapping,
 //   literals from `raw` when present, parentheses from precedence,
 //   comments as nodes: own line in statement lists, inline in expression lists.
-// Printers are plain functions `node -> string`, one per node type (PRINTERS).
+// Printers are plain functions `node -> Doc` (doc.ts), one per node type
+// (PRINTERS); the renderer turns the Doc into text and, if asked, a source map.
 import { toNode, type Node } from '../ast/node.ts'
+import { hardline, head, indent, join, mark, render, text, type Doc } from './doc.ts'
+import { MapBuilder, type SourceMap } from './sourcemap.ts'
+
+export type { Doc } from './doc.ts'
+export type { SourceMap } from './sourcemap.ts'
 
 // The AST is open-ended data; printers read slots and attrs by name.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type N = any
 
 interface Ctx {
-  /** Indentation of the current line. */
-  ind: string
   /** Inside a `for (init;;)`: a bare `in` would be read as for-in. */
   noIn?: boolean
 }
 
-const STEP = '  '
-const deeper = (ctx: Ctx): Ctx => ({ ind: ctx.ind + STEP })
-const plain = (ctx: Ctx): Ctx => ({ ind: ctx.ind })
+const PLAIN: Ctx = {}
+
+function doc(input: Node | object): Doc {
+  const ast = toNode(input)
+  if (ast.type === 'Program') {
+    const body = stmts((ast as N).body, PLAIN)
+    return mark(ast, head(body, 1) ? [body, '\n'] : '')
+  }
+  return print(ast, PLAIN)
+}
 
 /** Prints a node: a Node, a plain `{ type, ...attrs, children }` or an ESTree object. */
 export function emit(input: Node | object): string {
-  const ast = toNode(input)
-  if (ast.type === 'Program') {
-    const body = stmts((ast as N).body, { ind: '' })
-    return body ? body + '\n' : ''
-  }
-  return print(ast, { ind: '' })
+  return render(doc(input))
+}
+
+/** Code plus a Source Map v3 pointing at the origins of the nodes (see sourcemap.ts). */
+export function emitWithMap(input: Node | object): { code: string; map: SourceMap } {
+  const map = new MapBuilder()
+  const code = render(doc(input), map.sink)
+  return { code, map: map.toJSON() }
 }
 
 /** Nodes to wrap in parens once, whatever their position (see `wrapLeftmost`). */
 const wrapOnce = new WeakSet<object>()
 
-function print(node: N, ctx: Ctx): string {
+function print(node: N, ctx: Ctx): Doc {
   const printer = PRINTERS[node.type]
   if (!printer) throw new Error(`emit: unknown node type "${node.type}"`)
-  if (wrapOnce.delete(node)) return `(${printer(node, plain(ctx))})`
-  return printer(node, ctx)
+  if (wrapOnce.delete(node)) return mark(node, ['(', printer(node, PLAIN), ')'])
+  return mark(node, printer(node, ctx))
 }
 
 /** The node whose text starts the text of `n` (ignoring parens). */
@@ -144,16 +157,18 @@ function prec(n: N): number {
   }
 }
 
+const parens = (node: N): Doc => ['(', print(node, PLAIN), ')']
+
 /** `node` as an operand that must bind at least as tight as `min`. */
-function expr(node: N, ctx: Ctx, min = P.SEQ): string {
-  const parens = prec(node) < min || (ctx.noIn && node.type === 'BinaryExpression' && node.operator === 'in')
-  return parens ? `(${print(node, plain(ctx))})` : print(node, ctx)
+function expr(node: N, ctx: Ctx, min = P.SEQ): Doc {
+  const wrap = prec(node) < min || (ctx.noIn && node.type === 'BinaryExpression' && node.operator === 'in')
+  return wrap ? parens(node) : print(node, ctx)
 }
 
 /** Object of a member access, callee, tag: a left-hand-side expression. */
-function lhs(node: N, ctx: Ctx): string {
+function lhs(node: N, ctx: Ctx): Doc {
   // `(a?.b).c` ends the chain; without parens it would continue it.
-  if (node.type === 'ChainExpression') return `(${print(node, plain(ctx))})`
+  if (node.type === 'ChainExpression') return parens(node)
   return expr(node, ctx, P.CALL)
 }
 
@@ -171,7 +186,8 @@ function hasCall(n: N): boolean {
 // ---------------------------------------------------------------------------
 // Comments and lists
 
-const comment = (c: N) => (c.kind === 'Line' ? `//${c.value}` : `/*${c.value}*/`)
+const commentText = (c: N) => (c.kind === 'Line' ? `//${c.value}` : `/*${c.value}*/`)
+const comment = (c: N): Doc => mark(c, commentText(c))
 const isComment = (n: N) => n !== null && n.type === 'Comment'
 
 interface ListOptions {
@@ -191,7 +207,7 @@ interface ListOptions {
  * Items inline: `(a, /* c *\/ b)`. One per line when a line comment needs a line
  * break or comments end the list (inline they would read as the last item's).
  */
-function list(items: N[], ctx: Ctx, item: (n: N, ctx: Ctx) => string, o: ListOptions): string {
+function list(items: N[], ctx: Ctx, item: (n: N, ctx: Ctx) => Doc, o: ListOptions): Doc {
   const { open, close, sep = ',', pad = false, trailing = true, bare = false } = o
   const groups: { comments: N[]; node: N }[] = []
   let pending: N[] = []
@@ -206,26 +222,25 @@ function list(items: N[], ctx: Ctx, item: (n: N, ctx: Ctx) => string, o: ListOpt
 
   const multiline = pending.length > 0 || groups.some((g) => g.comments.some((c) => c.kind === 'Line'))
   if (!multiline) {
-    const inline = bare ? ctx : plain(ctx)
-    let s = groups.map((g) => [...g.comments.map(comment), item(g.node, inline)].join(' ')).join(`${sep} `)
-    if (groups.at(-1)!.node === null) s += sep // `[a, ,]`: a trailing hole needs its comma
-    return pad ? `${open} ${s} ${close}` : open + s + close
+    const inline = bare ? ctx : PLAIN
+    const s: Doc[] = join(`${sep} `, groups.map((g) => join(' ', [...g.comments.map(comment), item(g.node, inline)])))
+    if (groups.at(-1)!.node === null) s.push(sep) // `[a, ,]`: a trailing hole needs its comma
+    return pad ? [open, ' ', s, ' ', close] : [open, s, close]
   }
 
-  const inner = deeper(ctx)
-  const lines: string[] = []
+  const lines: Doc[] = []
   groups.forEach((g, i) => {
-    for (const c of g.comments) lines.push(inner.ind + comment(c))
+    for (const c of g.comments) lines.push(comment(c))
     const last = i === groups.length - 1
     const end = last && (!trailing || g.node?.type === 'RestElement') ? '' : sep.trim()
-    lines.push(inner.ind + (g.node === null ? '' : item(g.node, inner)) + end)
+    lines.push([g.node === null ? '' : item(g.node, PLAIN), end])
   })
-  for (const c of pending) lines.push(inner.ind + comment(c))
-  return `${open}\n${lines.join('\n')}\n${ctx.ind}${close}`
+  for (const c of pending) lines.push(comment(c))
+  return [open, indent([hardline, join(hardline, lines)]), hardline, close]
 }
 
-const exprItem = (n: N, ctx: Ctx) => (n === null ? '' : expr(n, ctx, P.ASSIGN))
-const nodeItem = (n: N, ctx: Ctx) => (n === null ? '' : print(n, ctx))
+const exprItem = (n: N, ctx: Ctx): Doc => (n === null ? '' : expr(n, ctx, P.ASSIGN))
+const nodeItem = (n: N, ctx: Ctx): Doc => (n === null ? '' : print(n, ctx))
 
 const args = (items: N[], ctx: Ctx) => list(items, ctx, exprItem, { open: '(', close: ')' })
 const params = (items: N[], ctx: Ctx) => list(items, ctx, nodeItem, { open: '(', close: ')' })
@@ -281,10 +296,10 @@ function spaced(n: N): boolean {
   return /^(FunctionDeclaration|ClassDeclaration|TSInterfaceDeclaration|TSModuleDeclaration|TSEnumDeclaration|StaticBlock)$/.test(n.type)
 }
 
-/** One per line, each indented by `ctx.ind`; comments on their own lines. */
-function stmts(items: N[], ctx: Ctx, { asi = true } = {}): string {
-  const lines: string[] = []
-  let pending: string[] = []
+/** One per line at the current indentation; comments on their own lines. */
+function stmts(items: N[], ctx: Ctx, { asi = true } = {}): Doc {
+  const lines: Doc[] = []
+  let pending: Doc[] = []
   let prev: N | undefined
   for (const n of items) {
     if (isComment(n)) {
@@ -292,22 +307,24 @@ function stmts(items: N[], ctx: Ctx, { asi = true } = {}): string {
       continue
     }
     let s = print(n, ctx)
-    if (asi && prev && openEnd(prev) && ASI_HAZARD.test(s)) s = ';' + s
+    if (asi && prev && openEnd(prev) && ASI_HAZARD.test(head(s, 1))) s = [';', s]
     if (prev && (spaced(prev) || spaced(n))) lines.push('')
-    for (const c of pending) lines.push(ctx.ind + c)
+    lines.push(...pending, s)
     pending = []
-    lines.push(ctx.ind + s)
     prev = n
   }
-  for (const c of pending) lines.push(ctx.ind + c)
-  return lines.join('\n')
+  lines.push(...pending)
+  return join(hardline, lines)
 }
 
-const block = (items: N[], ctx: Ctx, options?: { asi?: boolean }) =>
-  items.length ? `{\n${stmts(items, deeper(ctx), options)}\n${ctx.ind}}` : '{}'
+/** `{ ... }` with the items one level deeper. */
+const braces = (inner: Doc): Doc => ['{', indent([hardline, inner]), hardline, '}']
+
+const block = (items: N[], options?: { asi?: boolean }): Doc =>
+  items.length ? braces(stmts(items, PLAIN, options)) : '{}'
 
 /** Body of if/for/while: a block, or a statement on the same line. */
-const body = (n: N, ctx: Ctx) => ' ' + print(n, plain(ctx))
+const body = (n: N): Doc => [' ', print(n, PLAIN)]
 
 // ---------------------------------------------------------------------------
 // Literals
@@ -341,17 +358,17 @@ function literal(n: N): string {
 // Pieces shared by several node types
 
 /** `: T` */
-const ann = (n: N, ctx: Ctx) => (n ? ': ' + type(n.typeAnnotation, ctx) : '')
+const ann = (n: N): Doc => (n ? [': ', type(n.typeAnnotation)] : '')
 
-const typeParams = (n: N, ctx: Ctx) => (n ? list(n.params, ctx, nodeItem, { open: '<', close: '>' }) : '')
-const typeArgs = (n: N, ctx: Ctx) => (n ? list(n.params, ctx, typeItem, { open: '<', close: '>' }) : '')
+const typeParams = (n: N, ctx: Ctx): Doc => (n ? list(n.params, ctx, nodeItem, { open: '<', close: '>' }) : '')
+const typeArgs = (n: N, ctx: Ctx): Doc => (n ? list(n.params, ctx, typeItem, { open: '<', close: '>' }) : '')
 
-function decorators(items: N[] | undefined, ctx: Ctx) {
+function decorators(items: N[] | undefined, ctx: Ctx): Doc {
   if (!items?.length) return ''
-  return list(items, ctx, nodeItem, { open: '', close: '', sep: '', trailing: false }) + ' '
+  return [list(items, ctx, nodeItem, { open: '', close: '', sep: '', trailing: false }), ' ']
 }
 
-const key = (n: N, ctx: Ctx) => (n.computed ? `[${expr(n.key, plain(ctx), P.ASSIGN)}]` : print(n.key, ctx))
+const key = (n: N, ctx: Ctx): Doc => (n.computed ? ['[', expr(n.key, PLAIN, P.ASSIGN), ']'] : print(n.key, ctx))
 
 /** Modifiers in the order TypeScript accepts them. */
 function modifiers(n: N) {
@@ -366,49 +383,59 @@ function modifiers(n: N) {
 }
 
 /** `async get *name?<T>(a): R { ... }` for methods and object methods. */
-function method(n: N, ctx: Ctx, prefix: string) {
+function method(n: N, ctx: Ctx, prefix: string): Doc {
   const f = n.value
-  let s = decorators(n.decorators, ctx) + prefix
-  if (f.async) s += 'async '
-  if (n.kind === 'get' || n.kind === 'set') s += n.kind + ' '
-  if (f.generator) s += '*'
-  s += key(n, ctx) + (n.optional ? '?' : '')
-  return s + signature(f, ctx) + (f.body ? ' ' + block(f.body.body, ctx) : '')
+  let words = prefix
+  if (f.async) words += 'async '
+  if (n.kind === 'get' || n.kind === 'set') words += n.kind + ' '
+  if (f.generator) words += '*'
+  return [
+    decorators(n.decorators, ctx),
+    words,
+    key(n, ctx),
+    n.optional ? '?' : '',
+    signature(f, ctx),
+    f.body ? [' ', block(f.body.body)] : '',
+  ]
 }
 
 /** `<T>(a: A): R` */
-const signature = (f: N, ctx: Ctx) => typeParams(f.typeParameters, ctx) + params(f.params, ctx) + ann(f.returnType, ctx)
+const signature = (f: N, ctx: Ctx): Doc => [typeParams(f.typeParameters, ctx), params(f.params, ctx), ann(f.returnType)]
 
-function fn(n: N, ctx: Ctx) {
+function fn(n: N, ctx: Ctx): Doc {
   let s = n.declare ? 'declare ' : ''
   if (n.async) s += 'async '
-  s += 'function' + (n.generator ? '*' : '') + ' ' + (n.id ? print(n.id, ctx) : '')
-  return s + signature(n, ctx) + (n.body ? ' ' + block(n.body.body, ctx) : '')
+  s += 'function' + (n.generator ? '*' : '') + ' '
+  return [s, n.id ? print(n.id, ctx) : '', signature(n, ctx), n.body ? [' ', block(n.body.body)] : '']
 }
 
-function cls(n: N, ctx: Ctx) {
-  let s = decorators(n.decorators, ctx)
-  if (n.declare) s += 'declare '
-  if (n.abstract) s += 'abstract '
-  s += 'class' + (n.id ? ' ' + print(n.id, ctx) : '') + typeParams(n.typeParameters, ctx)
-  if (n.superClass) s += ' extends ' + lhs(n.superClass, ctx) + typeArgs(n.superTypeArguments, ctx)
-  if (n.implements?.length) s += ' implements ' + list(n.implements, ctx, nodeItem, { open: '', close: '', trailing: false })
-  return s + ' ' + print(n.body, ctx)
+function cls(n: N, ctx: Ctx): Doc {
+  const out: Doc[] = [decorators(n.decorators, ctx)]
+  if (n.declare) out.push('declare ')
+  if (n.abstract) out.push('abstract ')
+  out.push('class', n.id ? [' ', print(n.id, ctx)] : '', typeParams(n.typeParameters, ctx))
+  if (n.superClass) out.push(' extends ', lhs(n.superClass, ctx), typeArgs(n.superTypeArguments, ctx))
+  if (n.implements?.length) {
+    out.push(' implements ', list(n.implements, ctx, nodeItem, { open: '', close: '', trailing: false }))
+  }
+  out.push(' ', print(n.body, ctx))
+  return out
 }
 
 /** Identifier and patterns in a binding position: `a?: T`. */
-const binding = (n: N, ctx: Ctx, s: string) =>
-  decorators(n.decorators, ctx) + s + (n.optional ? '?' : '') + ann(n.typeAnnotation, ctx)
+const binding = (n: N, ctx: Ctx, s: Doc): Doc => [decorators(n.decorators, ctx), s, n.optional ? '?' : '', ann(n.typeAnnotation)]
 
 /** Statement-start forms that would be read as something else. */
 const STATEMENT_START = /^(\{|function\b|class\b|let\s*\[|async\s+function\b)/
 const DEFAULT_EXPORT_START = /^(function\b|class\b|async\s+function\b)/
+/** Long enough for every pattern above. */
+const START = 16
 
-const importSource = (n: N, ctx: Ctx) => ' from ' + print(n.source, ctx) + attributes(n, ctx)
+const importSource = (n: N, ctx: Ctx): Doc => [' from ', print(n.source, ctx), attributes(n, ctx)]
 
 /** ` with { type: 'json' }` */
-const attributes = (n: N, ctx: Ctx) =>
-  n.attributes?.length ? ' with ' + list(n.attributes, ctx, nodeItem, { open: '{', close: '}', pad: true }) : ''
+const attributes = (n: N, ctx: Ctx): Doc =>
+  n.attributes?.length ? [' with ', list(n.attributes, ctx, nodeItem, { open: '{', close: '}', pad: true })] : ''
 
 // ---------------------------------------------------------------------------
 // Types
@@ -436,12 +463,12 @@ function typePrec(n: N): number {
   }
 }
 
-function type(n: N, ctx: Ctx, min = T.FUNCTION): string {
-  const s = print(n, ctx)
-  return typePrec(n) < min ? `(${s})` : s
+function type(n: N, min = T.FUNCTION): Doc {
+  const s = print(n, PLAIN)
+  return typePrec(n) < min ? ['(', s, ')'] : s
 }
 
-const typeItem = (n: N, ctx: Ctx) => type(n, ctx)
+const typeItem = (n: N): Doc => type(n)
 
 const KEYWORDS: Record<string, string> = {
   TSAnyKeyword: 'any', TSUnknownKeyword: 'unknown', TSNumberKeyword: 'number', TSStringKeyword: 'string',
@@ -456,13 +483,24 @@ const readonlyMark = (v: unknown) => (v === '+' ? '+readonly ' : v === '-' ? '-r
 /** Members of a type literal: inline `{ a: A; b: B }`. */
 const typeMembers = (items: N[], ctx: Ctx) => list(items, ctx, nodeItem, { open: '{', close: '}', sep: ';', pad: true })
 
+/** `a${x}b` from quasis and the parts between them. */
+function template(quasis: N[], parts: N[], part: (n: N) => Doc): Doc {
+  const out: Doc[] = ['`']
+  quasis.forEach((q, i) => {
+    out.push(mark(q, q.value.raw))
+    if (i < parts.length) out.push('${', part(parts[i]), '}')
+  })
+  out.push('`')
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // Printers
 
-type Printer = (n: N, ctx: Ctx) => string
+type Printer = (n: N, ctx: Ctx) => Doc
 
 const PRINTERS: Record<string, Printer> = {
-  Comment: (n) => comment(n),
+  Comment: (n) => commentText(n),
 
   // --- statements ---
   Program: (n, ctx) => stmts(n.body, ctx),
@@ -470,70 +508,70 @@ const PRINTERS: Record<string, Printer> = {
     if (n.directive !== undefined) return print(n.expression, ctx)
     wrapLeftmost(n.expression, /^(FunctionExpression|ClassExpression|ObjectExpression)$/)
     const s = expr(n.expression, ctx)
-    return STATEMENT_START.test(s) ? `(${s})` : s
+    return STATEMENT_START.test(head(s, START)) ? ['(', s, ')'] : s
   },
-  BlockStatement: (n, ctx) => block(n.body, ctx),
-  StaticBlock: (n, ctx) => 'static ' + block(n.body, ctx),
+  BlockStatement: (n) => block(n.body),
+  StaticBlock: (n) => ['static ', block(n.body)],
   EmptyStatement: () => ';',
   DebuggerStatement: () => 'debugger',
-  ReturnStatement: (n, ctx) => 'return' + (n.argument ? ' ' + expr(n.argument, ctx) : ''),
-  ThrowStatement: (n, ctx) => 'throw ' + expr(n.argument, ctx),
-  BreakStatement: (n, ctx) => 'break' + (n.label ? ' ' + print(n.label, ctx) : ''),
-  ContinueStatement: (n, ctx) => 'continue' + (n.label ? ' ' + print(n.label, ctx) : ''),
-  LabeledStatement: (n, ctx) => print(n.label, ctx) + ':' + body(n.body, ctx),
-  WithStatement: (n, ctx) => `with (${expr(n.object, plain(ctx))})` + body(n.body, ctx),
-  WhileStatement: (n, ctx) => `while (${expr(n.test, plain(ctx))})` + body(n.body, ctx),
-  DoWhileStatement(n, ctx) {
-    const b = print(n.body, plain(ctx))
+  ReturnStatement: (n, ctx) => ['return', n.argument ? [' ', expr(n.argument, ctx)] : ''],
+  ThrowStatement: (n, ctx) => ['throw ', expr(n.argument, ctx)],
+  BreakStatement: (n, ctx) => ['break', n.label ? [' ', print(n.label, ctx)] : ''],
+  ContinueStatement: (n, ctx) => ['continue', n.label ? [' ', print(n.label, ctx)] : ''],
+  LabeledStatement: (n, ctx) => [print(n.label, ctx), ':', body(n.body)],
+  WithStatement: (n) => ['with (', expr(n.object, PLAIN), ')', body(n.body)],
+  WhileStatement: (n) => ['while (', expr(n.test, PLAIN), ')', body(n.body)],
+  DoWhileStatement(n) {
     // `do x() while (y)` is a syntax error without `;`, so a new line instead.
-    const sep = n.body.type === 'BlockStatement' ? ' ' : `\n${ctx.ind}`
-    return `do ${b}${sep}while (${expr(n.test, plain(ctx))})`
+    const sep = n.body.type === 'BlockStatement' ? ' ' : hardline
+    return ['do ', print(n.body, PLAIN), sep, 'while (', expr(n.test, PLAIN), ')']
   },
-  IfStatement(n, ctx) {
+  IfStatement(n) {
     let cons = n.consequent
     // `if (a) if (b) x; else y` would give the else to the inner if.
     if (n.alternate && danglingIf(cons)) cons = { type: 'BlockStatement', body: [cons] }
-    let s = `if (${expr(n.test, plain(ctx))})` + body(cons, ctx)
-    if (n.alternate) {
-      s += cons.type === 'BlockStatement' ? ' ' : `\n${ctx.ind}`
-      s += 'else' + body(n.alternate, ctx)
-    }
-    return s
+    const out: Doc[] = ['if (', expr(n.test, PLAIN), ')', body(cons)]
+    if (n.alternate) out.push(cons.type === 'BlockStatement' ? ' ' : hardline, 'else', body(n.alternate))
+    return out
   },
-  ForStatement(n, ctx) {
-    const head = { ind: ctx.ind, noIn: true }
+  ForStatement(n) {
+    const head = { noIn: true }
     const init = n.init ? (n.init.type === 'VariableDeclaration' ? print(n.init, head) : expr(n.init, head)) : ''
-    const test = n.test ? ' ' + expr(n.test, plain(ctx)) : ''
-    const update = n.update ? ' ' + expr(n.update, plain(ctx)) : ''
-    return `for (${init};${test};${update})` + body(n.body, ctx)
+    const test = n.test ? [' ', expr(n.test, PLAIN)] : ''
+    const update = n.update ? [' ', expr(n.update, PLAIN)] : ''
+    return ['for (', init, ';', test, ';', update, ')', body(n.body)]
   },
-  ForInStatement: (n, ctx) => `for (${forLeft(n.left, ctx)} in ${expr(n.right, plain(ctx))})` + body(n.body, ctx),
-  ForOfStatement: (n, ctx) =>
-    `for${n.await ? ' await' : ''} (${forLeft(n.left, ctx)} of ${expr(n.right, plain(ctx), P.ASSIGN)})` + body(n.body, ctx),
-  TryStatement(n, ctx) {
-    let s = 'try ' + print(n.block, ctx)
-    if (n.handler) s += ' ' + print(n.handler, ctx)
-    if (n.finalizer) s += ' finally ' + print(n.finalizer, ctx)
-    return s
-  },
-  CatchClause: (n, ctx) => 'catch ' + (n.param ? `(${print(n.param, ctx)}) ` : '') + print(n.body, ctx),
-  SwitchStatement(n, ctx) {
-    const head = `switch (${expr(n.discriminant, plain(ctx))}) `
-    return head + (n.cases.length ? `{\n${stmts(n.cases, deeper(ctx), { asi: false })}\n${ctx.ind}}` : '{}')
-  },
+  ForInStatement: (n) => ['for (', forLeft(n.left), ' in ', expr(n.right, PLAIN), ')', body(n.body)],
+  ForOfStatement: (n) =>
+    [`for${n.await ? ' await' : ''} (`, forLeft(n.left), ' of ', expr(n.right, PLAIN, P.ASSIGN), ')', body(n.body)],
+  TryStatement: (n, ctx) => [
+    'try ',
+    print(n.block, ctx),
+    n.handler ? [' ', print(n.handler, ctx)] : '',
+    n.finalizer ? [' finally ', print(n.finalizer, ctx)] : '',
+  ],
+  CatchClause: (n, ctx) => ['catch ', n.param ? ['(', print(n.param, ctx), ') '] : '', print(n.body, ctx)],
+  SwitchStatement: (n) => [
+    'switch (',
+    expr(n.discriminant, PLAIN),
+    ') ',
+    n.cases.length ? braces(stmts(n.cases, PLAIN, { asi: false })) : '{}',
+  ],
   SwitchCase(n, ctx) {
-    const head = n.test ? `case ${expr(n.test, ctx)}:` : 'default:'
+    const head: Doc = n.test ? ['case ', expr(n.test, ctx), ':'] : 'default:'
     const c = n.consequent
-    if (c.length === 1 && c[0].type === 'BlockStatement') return head + ' ' + print(c[0], ctx)
-    return c.length ? `${head}\n${stmts(c, deeper(ctx))}` : head
+    if (c.length === 1 && c[0].type === 'BlockStatement') return [head, ' ', print(c[0], ctx)]
+    return c.length ? [head, indent([hardline, stmts(c, PLAIN)])] : head
   },
-  VariableDeclaration(n, ctx) {
-    const decls = list(n.declarations, ctx, nodeItem, { open: '', close: '', trailing: false, bare: true })
-    return (n.declare ? 'declare ' : '') + n.kind + ' ' + decls
-  },
+  VariableDeclaration: (n, ctx) => [
+    n.declare ? 'declare ' : '',
+    n.kind,
+    ' ',
+    list(n.declarations, ctx, nodeItem, { open: '', close: '', trailing: false, bare: true }),
+  ],
   VariableDeclarator(n, ctx) {
-    const id = print(n.id, ctx) + (n.definite ? '!' : '')
-    return n.init ? `${id} = ${expr(n.init, ctx, P.ASSIGN)}` : id
+    const id = [print(n.id, ctx), n.definite ? '!' : '']
+    return n.init ? [id, ' = ', expr(n.init, ctx, P.ASSIGN)] : id
   },
   FunctionDeclaration: fn,
   FunctionExpression: fn,
@@ -541,7 +579,7 @@ const PRINTERS: Record<string, Printer> = {
   TSEmptyBodyFunctionExpression: fn,
   ClassDeclaration: cls,
   ClassExpression: cls,
-  ClassBody: (n, ctx) => block(n.body, ctx),
+  ClassBody: (n) => block(n.body),
   MethodDefinition: (n, ctx) => method(n, ctx, modifiers(n)),
   TSAbstractMethodDefinition: (n, ctx) => method(n, ctx, modifiers(n)),
   PropertyDefinition: property,
@@ -551,7 +589,7 @@ const PRINTERS: Record<string, Printer> = {
   Decorator(n, ctx) {
     const e = n.expression
     const simple = /^(Identifier|MemberExpression|CallExpression)$/.test(e.type) && !hasComputed(e)
-    return '@' + (simple ? print(e, ctx) : `(${print(e, plain(ctx))})`)
+    return ['@', simple ? print(e, ctx) : parens(e)]
   },
 
   // --- modules ---
@@ -559,46 +597,46 @@ const PRINTERS: Record<string, Printer> = {
     const s = 'import ' + (n.importKind === 'type' ? 'type ' : '') + (n.phase ? n.phase + ' ' : '')
     const specs: N[] = n.specifiers
     // `import {} from 'x'` and `import 'x'` are one AST; the short form wins.
-    if (!specs.some((x) => !isComment(x))) return s + print(n.source, ctx) + attributes(n, ctx)
+    if (!specs.some((x) => !isComment(x))) return [s, print(n.source, ctx), attributes(n, ctx)]
     const named = specs.filter((x) => x.type === 'ImportSpecifier' || isComment(x))
-    const head = specs.filter((x) => x.type === 'ImportDefaultSpecifier' || x.type === 'ImportNamespaceSpecifier')
-    const parts = head.map((x) => print(x, ctx))
+    const front = specs.filter((x) => x.type === 'ImportDefaultSpecifier' || x.type === 'ImportNamespaceSpecifier')
+    const parts: Doc[] = front.map((x) => print(x, ctx))
     if (named.some((x) => !isComment(x))) parts.push(list(named, ctx, nodeItem, { open: '{', close: '}', pad: true }))
-    return s + parts.join(', ') + importSource(n, ctx)
+    return [s, join(', ', parts), importSource(n, ctx)]
   },
   ImportDefaultSpecifier: (n, ctx) => print(n.local, ctx),
-  ImportNamespaceSpecifier: (n, ctx) => '* as ' + print(n.local, ctx),
+  ImportNamespaceSpecifier: (n, ctx) => ['* as ', print(n.local, ctx)],
   ImportSpecifier(n, ctx) {
     const kind = n.importKind === 'type' ? 'type ' : ''
     const imported = print(n.imported, ctx)
     const local = print(n.local, ctx)
-    return kind + (imported === local ? local : `${imported} as ${local}`)
+    return [kind, text(imported) === text(local) ? local : [imported, ' as ', local]]
   },
-  ImportAttribute: (n, ctx) => `${print(n.key, ctx)}: ${print(n.value, ctx)}`,
+  ImportAttribute: (n, ctx) => [print(n.key, ctx), ': ', print(n.value, ctx)],
   ExportNamedDeclaration(n, ctx) {
-    if (n.declaration) return 'export ' + print(n.declaration, ctx)
+    if (n.declaration) return ['export ', print(n.declaration, ctx)]
     const kind = n.exportKind === 'type' ? 'type ' : ''
     const specs = list(n.specifiers, ctx, nodeItem, { open: '{', close: '}', pad: true })
-    return 'export ' + kind + specs + (n.source ? importSource(n, ctx) : '')
+    return ['export ', kind, specs, n.source ? importSource(n, ctx) : '']
   },
   ExportSpecifier(n, ctx) {
     const kind = n.exportKind === 'type' ? 'type ' : ''
     const local = print(n.local, ctx)
     const exported = print(n.exported, ctx)
-    return kind + (local === exported ? local : `${local} as ${exported}`)
+    return [kind, text(local) === text(exported) ? local : [local, ' as ', exported]]
   },
   ExportDefaultDeclaration(n, ctx) {
     const d = n.declaration
     if (/^(FunctionDeclaration|ClassDeclaration|TSDeclareFunction|TSInterfaceDeclaration)$/.test(d.type)) {
-      return 'export default ' + print(d, ctx)
+      return ['export default ', print(d, ctx)]
     }
     wrapLeftmost(d, /^(FunctionExpression|ClassExpression)$/)
     const s = expr(d, ctx, P.ASSIGN)
-    return 'export default ' + (DEFAULT_EXPORT_START.test(s) ? `(${s})` : s)
+    return ['export default ', DEFAULT_EXPORT_START.test(head(s, START)) ? ['(', s, ')'] : s]
   },
   ExportAllDeclaration(n, ctx) {
     const kind = n.exportKind === 'type' ? 'type ' : ''
-    return 'export ' + kind + '*' + (n.exported ? ' as ' + print(n.exported, ctx) : '') + importSource(n, ctx)
+    return ['export ', kind, '*', n.exported ? [' as ', print(n.exported, ctx)] : '', importSource(n, ctx)]
   },
 
   // --- expressions ---
@@ -607,17 +645,10 @@ const PRINTERS: Record<string, Printer> = {
   Literal: literal,
   ThisExpression: () => 'this',
   Super: () => 'super',
-  MetaProperty: (n, ctx) => `${print(n.meta, ctx)}.${print(n.property, ctx)}`,
-  TemplateLiteral(n, ctx) {
-    let s = '`'
-    n.quasis.forEach((q: N, i: number) => {
-      s += q.value.raw
-      if (i < n.expressions.length) s += '${' + expr(n.expressions[i], plain(ctx)) + '}'
-    })
-    return s + '`'
-  },
+  MetaProperty: (n, ctx) => [print(n.meta, ctx), '.', print(n.property, ctx)],
+  TemplateLiteral: (n) => template(n.quasis, n.expressions, (e) => expr(e, PLAIN)),
   TemplateElement: (n) => n.value.raw,
-  TaggedTemplateExpression: (n, ctx) => lhs(n.tag, ctx) + typeArgs(n.typeArguments, ctx) + print(n.quasi, ctx),
+  TaggedTemplateExpression: (n, ctx) => [lhs(n.tag, ctx), typeArgs(n.typeArguments, ctx), print(n.quasi, ctx)],
   ArrayExpression: (n, ctx) => list(n.elements, ctx, exprItem, { open: '[', close: ']' }),
   ArrayPattern: (n, ctx) => binding(n, ctx, list(n.elements, ctx, nodeItem, { open: '[', close: ']' })),
   ObjectExpression: (n, ctx) => list(n.properties, ctx, nodeItem, { open: '{', close: '}', pad: true }),
@@ -625,201 +656,239 @@ const PRINTERS: Record<string, Printer> = {
   Property(n, ctx) {
     if (n.method || n.kind === 'get' || n.kind === 'set') return method(n, ctx, '')
     if (n.shorthand) return print(n.value, ctx)
-    return `${key(n, ctx)}: ${expr(n.value, ctx, P.ASSIGN)}`
+    return [key(n, ctx), ': ', expr(n.value, ctx, P.ASSIGN)]
   },
-  SpreadElement: (n, ctx) => '...' + expr(n.argument, ctx, P.ASSIGN),
-  RestElement: (n, ctx) => binding(n, ctx, '...' + print(n.argument, ctx)),
-  AssignmentPattern: (n, ctx) => `${print(n.left, ctx)} = ${expr(n.right, ctx, P.ASSIGN)}`,
+  SpreadElement: (n, ctx) => ['...', expr(n.argument, ctx, P.ASSIGN)],
+  RestElement: (n, ctx) => binding(n, ctx, ['...', print(n.argument, ctx)]),
+  AssignmentPattern: (n, ctx) => [print(n.left, ctx), ' = ', expr(n.right, ctx, P.ASSIGN)],
   ArrowFunctionExpression(n, ctx) {
-    let s = n.async ? 'async ' : ''
+    const out: Doc[] = [n.async ? 'async ' : '']
     // `<T,>`: a bare `<T>` would start JSX in .tsx files.
     const tp = n.typeParameters
-    if (tp?.params.length === 1 && !tp.params[0].constraint && !isComment(tp.params[0])) s += `<${print(tp.params[0], ctx)},>`
-    else s += typeParams(tp, ctx)
-    s += params(n.params, ctx) + ann(n.returnType, ctx) + ' => '
-    if (n.body.type === 'BlockStatement') return s + block(n.body.body, ctx)
+    if (tp?.params.length === 1 && !tp.params[0].constraint && !isComment(tp.params[0])) {
+      out.push(mark(tp, ['<', print(tp.params[0], ctx), ',>']))
+    } else out.push(typeParams(tp, ctx))
+    out.push(params(n.params, ctx), ann(n.returnType), ' => ')
+    if (n.body.type === 'BlockStatement') return [out, mark(n.body, block(n.body.body))]
     wrapLeftmost(n.body, /^ObjectExpression$/)
     const b = expr(n.body, ctx, P.ASSIGN)
-    return s + (b.startsWith('{') ? `(${b})` : b)
+    return [out, head(b, 1) === '{' ? ['(', b, ')'] : b]
   },
   SequenceExpression: (n, ctx) =>
     list(n.expressions, ctx, exprItem, { open: '', close: '', trailing: false, bare: true }),
-  AssignmentExpression: (n, ctx) => `${expr(n.left, ctx, P.CALL)} ${n.operator} ${expr(n.right, ctx, P.ASSIGN)}`,
-  ConditionalExpression: (n, ctx) =>
-    `${expr(n.test, ctx, P.NULLISH)} ? ${expr(n.consequent, ctx, P.ASSIGN)} : ${expr(n.alternate, ctx, P.ASSIGN)}`,
+  AssignmentExpression: (n, ctx) => [expr(n.left, ctx, P.CALL), ` ${n.operator} `, expr(n.right, ctx, P.ASSIGN)],
+  ConditionalExpression: (n, ctx) => [
+    expr(n.test, ctx, P.NULLISH),
+    ' ? ',
+    expr(n.consequent, ctx, P.ASSIGN),
+    ' : ',
+    expr(n.alternate, ctx, P.ASSIGN),
+  ],
   LogicalExpression: binary,
   BinaryExpression: binary,
   UnaryExpression(n, ctx) {
     const arg = expr(n.argument, ctx, P.UNARY)
-    if (/^[a-z]/.test(n.operator)) return `${n.operator} ${arg}`
+    if (/^[a-z]/.test(n.operator)) return [n.operator, ' ', arg]
     // `- -x`, `+ +x`, `- --x`: no space would make `--`/`++`.
-    return n.operator + ((n.operator === '-' || n.operator === '+') && arg[0] === n.operator ? ' ' : '') + arg
+    const space = (n.operator === '-' || n.operator === '+') && head(arg, 1) === n.operator
+    return [n.operator, space ? ' ' : '', arg]
   },
   UpdateExpression(n, ctx) {
     const arg = expr(n.argument, ctx, P.CALL)
-    return n.prefix ? n.operator + arg : arg + n.operator
+    return n.prefix ? [n.operator, arg] : [arg, n.operator]
   },
-  AwaitExpression: (n, ctx) => 'await ' + expr(n.argument, ctx, P.UNARY),
+  AwaitExpression: (n, ctx) => ['await ', expr(n.argument, ctx, P.UNARY)],
   YieldExpression: (n, ctx) =>
-    'yield' + (n.delegate ? '*' : '') + (n.argument ? ' ' + expr(n.argument, ctx, P.ASSIGN) : ''),
+    ['yield', n.delegate ? '*' : '', n.argument ? [' ', expr(n.argument, ctx, P.ASSIGN)] : ''],
   CallExpression: (n, ctx) =>
-    lhs(n.callee, ctx) + (n.optional ? '?.' : '') + typeArgs(n.typeArguments, ctx) + args(n.arguments, ctx),
+    [lhs(n.callee, ctx), n.optional ? '?.' : '', typeArgs(n.typeArguments, ctx), args(n.arguments, ctx)],
   NewExpression(n, ctx) {
-    const callee = hasCall(n.callee) ? `(${print(n.callee, plain(ctx))})` : lhs(n.callee, ctx)
-    return 'new ' + callee + typeArgs(n.typeArguments, ctx) + args(n.arguments, ctx)
+    const callee = hasCall(n.callee) ? parens(n.callee) : lhs(n.callee, ctx)
+    return ['new ', callee, typeArgs(n.typeArguments, ctx), args(n.arguments, ctx)]
   },
   MemberExpression(n, ctx) {
     let obj = lhs(n.object, ctx)
     // `1.toString()` would read `1.` as the number.
-    if (n.object.type === 'Literal' && /^\d+$/.test(obj)) obj = `(${obj})`
-    if (n.computed) return `${obj}${n.optional ? '?.' : ''}[${expr(n.property, plain(ctx))}]`
-    return `${obj}${n.optional ? '?.' : '.'}${print(n.property, ctx)}`
+    if (n.object.type === 'Literal' && /^\d+$/.test(text(obj))) obj = ['(', obj, ')']
+    if (n.computed) return [obj, n.optional ? '?.' : '', '[', expr(n.property, PLAIN), ']']
+    return [obj, n.optional ? '?.' : '.', print(n.property, ctx)]
   },
   ChainExpression: (n, ctx) => print(n.expression, ctx),
-  ImportExpression: (n, ctx) => 'import' + args(n.options ? [n.source, n.options] : [n.source], ctx),
+  ImportExpression: (n, ctx) => ['import', args(n.options ? [n.source, n.options] : [n.source], ctx)],
 
   // --- JSX ---
   JSXElement: (n, ctx) =>
-    print(n.openingElement, ctx) + jsxChildren(n.content, ctx) + (n.closingElement ? print(n.closingElement, ctx) : ''),
-  JSXFragment: (n, ctx) => '<>' + jsxChildren(n.content, ctx) + '</>',
+    [print(n.openingElement, ctx), jsxChildren(n.content, ctx), n.closingElement ? print(n.closingElement, ctx) : ''],
+  JSXFragment: (n, ctx) => ['<>', jsxChildren(n.content, ctx), '</>'],
   JSXOpeningElement(n, ctx) {
     const attrs = list(n.attributes, ctx, nodeItem, { open: '', close: '', sep: '', trailing: false })
-    const name = print(n.name, ctx) + typeArgs(n.typeArguments, ctx)
-    const sp = attrs.startsWith('\n') || !attrs ? attrs : ' ' + attrs
-    return `<${name}${sp}${n.selfClosing ? (sp.startsWith('\n') ? '/>' : ' />') : '>'}`
+    const first = head(attrs, 1)
+    const multiline = first === '\n'
+    const sp = multiline || !first ? attrs : [' ', attrs]
+    const end = n.selfClosing ? (multiline ? '/>' : ' />') : '>'
+    return ['<', print(n.name, ctx), typeArgs(n.typeArguments, ctx), sp, end]
   },
-  JSXClosingElement: (n, ctx) => `</${print(n.name, ctx)}>`,
-  JSXAttribute: (n, ctx) => print(n.name, ctx) + (n.value ? '=' + print(n.value, ctx) : ''),
-  JSXSpreadAttribute: (n, ctx) => `{...${expr(n.argument, plain(ctx), P.ASSIGN)}}`,
-  JSXSpreadChild: (n, ctx) => `{...${expr(n.expression, plain(ctx), P.ASSIGN)}}`,
-  JSXExpressionContainer: (n, ctx) => `{${expr(n.expression, plain(ctx), P.ASSIGN)}}`,
+  JSXClosingElement: (n, ctx) => ['</', print(n.name, ctx), '>'],
+  JSXAttribute: (n, ctx) => [print(n.name, ctx), n.value ? ['=', print(n.value, ctx)] : ''],
+  JSXSpreadAttribute: (n) => ['{...', expr(n.argument, PLAIN, P.ASSIGN), '}'],
+  JSXSpreadChild: (n) => ['{...', expr(n.expression, PLAIN, P.ASSIGN), '}'],
+  JSXExpressionContainer: (n) => ['{', expr(n.expression, PLAIN, P.ASSIGN), '}'],
   JSXEmptyExpression: () => '',
   JSXText: (n) => n.raw,
   JSXIdentifier: (n) => n.name,
-  JSXNamespacedName: (n, ctx) => `${print(n.namespace, ctx)}:${print(n.name, ctx)}`,
-  JSXMemberExpression: (n, ctx) => `${print(n.object, ctx)}.${print(n.property, ctx)}`,
+  JSXNamespacedName: (n, ctx) => [print(n.namespace, ctx), ':', print(n.name, ctx)],
+  JSXMemberExpression: (n, ctx) => [print(n.object, ctx), '.', print(n.property, ctx)],
 
   // --- TypeScript: expressions and declarations ---
-  TSAsExpression: (n, ctx) => `${expr(n.expression, ctx, P.AS)} as ${type(n.typeAnnotation, ctx)}`,
-  TSSatisfiesExpression: (n, ctx) => `${expr(n.expression, ctx, P.AS)} satisfies ${type(n.typeAnnotation, ctx)}`,
-  TSNonNullExpression: (n, ctx) => lhs(n.expression, ctx) + '!',
-  TSTypeAssertion: (n, ctx) => `<${type(n.typeAnnotation, ctx)}>${expr(n.expression, ctx, P.UNARY)}`,
-  TSInstantiationExpression: (n, ctx) => lhs(n.expression, ctx) + typeArgs(n.typeArguments, ctx),
-  TSParameterProperty: (n, ctx) => decorators(n.decorators, ctx) + modifiers(n) + print(n.parameter, ctx),
-  TSTypeAliasDeclaration: (n, ctx) =>
-    `${n.declare ? 'declare ' : ''}type ${print(n.id, ctx)}${typeParams(n.typeParameters, ctx)} = ${type(n.typeAnnotation, ctx)}`,
+  TSAsExpression: (n, ctx) => [expr(n.expression, ctx, P.AS), ' as ', type(n.typeAnnotation)],
+  TSSatisfiesExpression: (n, ctx) => [expr(n.expression, ctx, P.AS), ' satisfies ', type(n.typeAnnotation)],
+  TSNonNullExpression: (n, ctx) => [lhs(n.expression, ctx), '!'],
+  TSTypeAssertion: (n, ctx) => ['<', type(n.typeAnnotation), '>', expr(n.expression, ctx, P.UNARY)],
+  TSInstantiationExpression: (n, ctx) => [lhs(n.expression, ctx), typeArgs(n.typeArguments, ctx)],
+  TSParameterProperty: (n, ctx) => [decorators(n.decorators, ctx), modifiers(n), print(n.parameter, ctx)],
+  TSTypeAliasDeclaration: (n, ctx) => [
+    n.declare ? 'declare ' : '',
+    'type ',
+    print(n.id, ctx),
+    typeParams(n.typeParameters, ctx),
+    ' = ',
+    type(n.typeAnnotation),
+  ],
   TSInterfaceDeclaration(n, ctx) {
-    let s = `${n.declare ? 'declare ' : ''}interface ${print(n.id, ctx)}${typeParams(n.typeParameters, ctx)}`
-    if (n.extends?.length) s += ' extends ' + list(n.extends, ctx, nodeItem, { open: '', close: '', trailing: false })
-    return s + ' ' + print(n.body, ctx)
+    const out: Doc[] = [n.declare ? 'declare ' : '', 'interface ', print(n.id, ctx), typeParams(n.typeParameters, ctx)]
+    if (n.extends?.length) out.push(' extends ', list(n.extends, ctx, nodeItem, { open: '', close: '', trailing: false }))
+    out.push(' ', print(n.body, ctx))
+    return out
   },
-  TSInterfaceBody: (n, ctx) => block(n.body, ctx, { asi: false }),
-  TSInterfaceHeritage: (n, ctx) => lhs(n.expression, ctx) + typeArgs(n.typeArguments, ctx),
-  TSClassImplements: (n, ctx) => lhs(n.expression, ctx) + typeArgs(n.typeArguments, ctx),
+  TSInterfaceBody: (n) => block(n.body, { asi: false }),
+  TSInterfaceHeritage: (n, ctx) => [lhs(n.expression, ctx), typeArgs(n.typeArguments, ctx)],
+  TSClassImplements: (n, ctx) => [lhs(n.expression, ctx), typeArgs(n.typeArguments, ctx)],
   TSEnumDeclaration: (n, ctx) =>
-    `${n.declare ? 'declare ' : ''}${n.const ? 'const ' : ''}enum ${print(n.id, ctx)} ${print(n.body, ctx)}`,
+    [n.declare ? 'declare ' : '', n.const ? 'const ' : '', 'enum ', print(n.id, ctx), ' ', print(n.body, ctx)],
   TSEnumBody: (n, ctx) => list(n.members, ctx, nodeItem, { open: '{', close: '}', pad: true }),
-  TSEnumMember: (n, ctx) =>
-    (n.computed ? `[${print(n.id, ctx)}]` : print(n.id, ctx)) +
-    (n.initializer ? ' = ' + expr(n.initializer, ctx, P.ASSIGN) : ''),
+  TSEnumMember: (n, ctx) => [
+    n.computed ? ['[', print(n.id, ctx), ']'] : print(n.id, ctx),
+    n.initializer ? [' = ', expr(n.initializer, ctx, P.ASSIGN)] : '',
+  ],
   TSModuleDeclaration(n, ctx) {
-    let s = n.declare ? 'declare ' : ''
-    s += n.kind === 'global' ? 'global' : `${n.kind} ${print(n.id, ctx)}`
-    return n.body ? s + ' ' + print(n.body, ctx) : s
+    const head: Doc = [n.declare ? 'declare ' : '', n.kind === 'global' ? 'global' : [n.kind, ' ', print(n.id, ctx)]]
+    return n.body ? [head, ' ', print(n.body, ctx)] : head
   },
-  TSModuleBlock: (n, ctx) => block(n.body, ctx),
+  TSModuleBlock: (n) => block(n.body),
   TSImportEqualsDeclaration: (n, ctx) =>
-    `import ${n.importKind === 'type' ? 'type ' : ''}${print(n.id, ctx)} = ${print(n.moduleReference, ctx)}`,
-  TSExternalModuleReference: (n, ctx) => `require(${print(n.expression, ctx)})`,
-  TSExportAssignment: (n, ctx) => 'export = ' + expr(n.expression, ctx, P.ASSIGN),
-  TSNamespaceExportDeclaration: (n, ctx) => 'export as namespace ' + print(n.id, ctx),
+    ['import ', n.importKind === 'type' ? 'type ' : '', print(n.id, ctx), ' = ', print(n.moduleReference, ctx)],
+  TSExternalModuleReference: (n, ctx) => ['require(', print(n.expression, ctx), ')'],
+  TSExportAssignment: (n, ctx) => ['export = ', expr(n.expression, ctx, P.ASSIGN)],
+  TSNamespaceExportDeclaration: (n, ctx) => ['export as namespace ', print(n.id, ctx)],
   TSIndexSignature: (n, ctx) =>
-    modifiers(n) + list(n.parameters, ctx, nodeItem, { open: '[', close: ']' }) + ann(n.typeAnnotation, ctx),
-  TSTypeParameterDeclaration: (n, ctx) => typeParams(n, ctx),
-  TSTypeParameterInstantiation: (n, ctx) => typeArgs(n, ctx),
+    [modifiers(n), list(n.parameters, ctx, nodeItem, { open: '[', close: ']' }), ann(n.typeAnnotation)],
+  TSTypeParameterDeclaration: (n, ctx) => list(n.params, ctx, nodeItem, { open: '<', close: '>' }),
+  TSTypeParameterInstantiation: (n, ctx) => list(n.params, ctx, typeItem, { open: '<', close: '>' }),
   TSTypeParameter(n, ctx) {
-    let s = (n.const ? 'const ' : '') + (n.in ? 'in ' : '') + (n.out ? 'out ' : '') + print(n.name, ctx)
-    if (n.constraint) s += ' extends ' + type(n.constraint, ctx)
-    if (n.default) s += ' = ' + type(n.default, ctx)
-    return s
+    const mods = (n.const ? 'const ' : '') + (n.in ? 'in ' : '') + (n.out ? 'out ' : '')
+    return [
+      mods,
+      print(n.name, ctx),
+      n.constraint ? [' extends ', type(n.constraint)] : '',
+      n.default ? [' = ', type(n.default)] : '',
+    ]
   },
-  TSTypeAnnotation: (n, ctx) => type(n.typeAnnotation, ctx),
+  TSTypeAnnotation: (n) => type(n.typeAnnotation),
 
   // --- TypeScript: types ---
-  TSTypeReference: (n, ctx) => print(n.typeName, ctx) + typeArgs(n.typeArguments, ctx),
-  TSQualifiedName: (n, ctx) => `${print(n.left, ctx)}.${print(n.right, ctx)}`,
+  TSTypeReference: (n, ctx) => [print(n.typeName, ctx), typeArgs(n.typeArguments, ctx)],
+  TSQualifiedName: (n, ctx) => [print(n.left, ctx), '.', print(n.right, ctx)],
   TSUnionType: (n, ctx) =>
-    list(n.types, ctx, (t, c) => type(t, c, T.INTERSECTION), { open: '', close: '', sep: ' |', trailing: false }),
+    list(n.types, ctx, (t) => type(t, T.INTERSECTION), { open: '', close: '', sep: ' |', trailing: false }),
   TSIntersectionType: (n, ctx) =>
-    list(n.types, ctx, (t, c) => type(t, c, T.OPERATOR), { open: '', close: '', sep: ' &', trailing: false }),
-  TSArrayType: (n, ctx) => type(n.elementType, ctx, T.POSTFIX) + '[]',
-  TSIndexedAccessType: (n, ctx) => `${type(n.objectType, ctx, T.POSTFIX)}[${type(n.indexType, ctx)}]`,
-  TSTypeOperator: (n, ctx) => `${n.operator} ${type(n.typeAnnotation, ctx, T.OPERATOR)}`,
-  TSInferType: (n, ctx) => 'infer ' + print(n.typeParameter, ctx),
-  TSConditionalType: (n, ctx) =>
-    `${type(n.checkType, ctx, T.UNION)} extends ${type(n.extendsType, ctx, T.UNION)} ? ${type(n.trueType, ctx)} : ${type(n.falseType, ctx)}`,
-  TSFunctionType: (n, ctx) => `${signatureNoReturn(n, ctx)} => ${type(n.returnType.typeAnnotation, ctx)}`,
+    list(n.types, ctx, (t) => type(t, T.OPERATOR), { open: '', close: '', sep: ' &', trailing: false }),
+  TSArrayType: (n) => [type(n.elementType, T.POSTFIX), '[]'],
+  TSIndexedAccessType: (n) => [type(n.objectType, T.POSTFIX), '[', type(n.indexType), ']'],
+  TSTypeOperator: (n) => [n.operator, ' ', type(n.typeAnnotation, T.OPERATOR)],
+  TSInferType: (n, ctx) => ['infer ', print(n.typeParameter, ctx)],
+  TSConditionalType: (n) => [
+    type(n.checkType, T.UNION),
+    ' extends ',
+    type(n.extendsType, T.UNION),
+    ' ? ',
+    type(n.trueType),
+    ' : ',
+    type(n.falseType),
+  ],
+  TSFunctionType: (n, ctx) => [signatureNoReturn(n, ctx), ' => ', returnType(n.returnType)],
   TSConstructorType: (n, ctx) =>
-    `${n.abstract ? 'abstract ' : ''}new ${signatureNoReturn(n, ctx)} => ${type(n.returnType.typeAnnotation, ctx)}`,
+    [n.abstract ? 'abstract ' : '', 'new ', signatureNoReturn(n, ctx), ' => ', returnType(n.returnType)],
   TSTypeLiteral: (n, ctx) => typeMembers(n.members, ctx),
   TSPropertySignature: (n, ctx) =>
-    (n.readonly ? 'readonly ' : '') + key(n, ctx) + (n.optional ? '?' : '') + ann(n.typeAnnotation, ctx),
+    [n.readonly ? 'readonly ' : '', key(n, ctx), n.optional ? '?' : '', ann(n.typeAnnotation)],
   TSMethodSignature(n, ctx) {
     const kind = n.kind === 'get' || n.kind === 'set' ? n.kind + ' ' : ''
-    return kind + key(n, ctx) + (n.optional ? '?' : '') + signature(n, ctx)
+    return [kind, key(n, ctx), n.optional ? '?' : '', signature(n, ctx)]
   },
   TSCallSignatureDeclaration: (n, ctx) => signature(n, ctx),
-  TSConstructSignatureDeclaration: (n, ctx) => 'new ' + signature(n, ctx),
+  TSConstructSignatureDeclaration: (n, ctx) => ['new ', signature(n, ctx)],
   TSMappedType(n, ctx) {
-    let s = readonlyMark(n.readonly) + `[${print(n.key, ctx)} in ${type(n.constraint, ctx)}`
-    if (n.nameType) s += ' as ' + type(n.nameType, ctx)
-    s += ']' + optionalMark(n.optional)
-    if (n.typeAnnotation) s += ': ' + type(n.typeAnnotation, ctx)
-    return `{ ${s} }`
+    return [
+      '{ ',
+      readonlyMark(n.readonly),
+      '[',
+      print(n.key, ctx),
+      ' in ',
+      type(n.constraint),
+      n.nameType ? [' as ', type(n.nameType)] : '',
+      ']',
+      optionalMark(n.optional),
+      n.typeAnnotation ? [': ', type(n.typeAnnotation)] : '',
+      ' }',
+    ]
   },
   TSTupleType: (n, ctx) => list(n.elementTypes, ctx, typeItem, { open: '[', close: ']' }),
-  TSNamedTupleMember: (n, ctx) => `${print(n.label, ctx)}${n.optional ? '?' : ''}: ${type(n.elementType, ctx)}`,
-  TSOptionalType: (n, ctx) => type(n.typeAnnotation, ctx, T.POSTFIX) + '?',
-  TSRestType: (n, ctx) => '...' + type(n.typeAnnotation, ctx),
+  TSNamedTupleMember: (n, ctx) => [print(n.label, ctx), n.optional ? '?' : '', ': ', type(n.elementType)],
+  TSOptionalType: (n) => [type(n.typeAnnotation, T.POSTFIX), '?'],
+  TSRestType: (n) => ['...', type(n.typeAnnotation)],
   TSLiteralType: (n, ctx) => print(n.literal, ctx),
-  TSTemplateLiteralType(n, ctx) {
-    let s = '`'
-    n.quasis.forEach((q: N, i: number) => {
-      s += q.value.raw
-      if (i < n.types.length) s += '${' + type(n.types[i], ctx) + '}'
-    })
-    return s + '`'
-  },
-  TSTypeQuery: (n, ctx) => 'typeof ' + print(n.exprName, ctx) + typeArgs(n.typeArguments, ctx),
-  TSImportType(n, ctx) {
-    let s = 'import' + list(n.options ? [n.source, n.options] : [n.source], ctx, nodeItem, { open: '(', close: ')' })
-    if (n.qualifier) s += '.' + print(n.qualifier, ctx)
-    return s + typeArgs(n.typeArguments, ctx)
-  },
+  TSTemplateLiteralType: (n) => template(n.quasis, n.types, (t) => type(t)),
+  TSTypeQuery: (n, ctx) => ['typeof ', print(n.exprName, ctx), typeArgs(n.typeArguments, ctx)],
+  TSImportType: (n, ctx) => [
+    'import',
+    list(n.options ? [n.source, n.options] : [n.source], ctx, nodeItem, { open: '(', close: ')' }),
+    n.qualifier ? ['.', print(n.qualifier, ctx)] : '',
+    typeArgs(n.typeArguments, ctx),
+  ],
   TSTypePredicate(n, ctx) {
-    const s = (n.asserts ? 'asserts ' : '') + print(n.parameterName, ctx)
-    return n.typeAnnotation ? `${s} is ${type(n.typeAnnotation.typeAnnotation, ctx)}` : s
+    const s: Doc = [n.asserts ? 'asserts ' : '', print(n.parameterName, ctx)]
+    return n.typeAnnotation ? [s, ' is ', returnType(n.typeAnnotation)] : s
   },
 }
 
 for (const [name, word] of Object.entries(KEYWORDS)) PRINTERS[name] = () => word
 
-function property(n: N, ctx: Ctx) {
-  let s = decorators(n.decorators, ctx) + modifiers(n)
-  if (n.type === 'AccessorProperty' || n.type === 'TSAbstractAccessorProperty') s += 'accessor '
-  s += key(n, ctx) + (n.optional ? '?' : '') + (n.definite ? '!' : '') + ann(n.typeAnnotation, ctx)
-  return n.value ? `${s} = ${expr(n.value, ctx, P.ASSIGN)}` : s
+/** A TSTypeAnnotation printed without `: ` (after `=>`, `is`); marked as itself. */
+const returnType = (n: N): Doc => mark(n, type(n.typeAnnotation))
+
+function property(n: N, ctx: Ctx): Doc {
+  const accessor = n.type === 'AccessorProperty' || n.type === 'TSAbstractAccessorProperty' ? 'accessor ' : ''
+  const s: Doc = [
+    decorators(n.decorators, ctx),
+    modifiers(n),
+    accessor,
+    key(n, ctx),
+    n.optional ? '?' : '',
+    n.definite ? '!' : '',
+    ann(n.typeAnnotation),
+  ]
+  return n.value ? [s, ' = ', expr(n.value, ctx, P.ASSIGN)] : s
 }
 
-function binary(n: N, ctx: Ctx) {
+function binary(n: N, ctx: Ctx): Doc {
   const p = BINARY[n.operator]
   const right = n.operator === '**'
   let l = expr(n.left, ctx, right ? P.POSTFIX : p)
   let r = expr(n.right, ctx, right ? p : p + 1)
   // `a ?? b || c` is a syntax error: `??` never mixes with `||`/`&&` without parens.
-  if (mixesNullish(n, n.left) && !l.startsWith('(')) l = `(${l})`
-  if (mixesNullish(n, n.right) && !r.startsWith('(')) r = `(${r})`
-  return `${l} ${n.operator} ${r}`
+  if (mixesNullish(n, n.left) && head(l, 1) !== '(') l = ['(', l, ')']
+  if (mixesNullish(n, n.right) && head(r, 1) !== '(') r = ['(', r, ')']
+  return [l, ` ${n.operator} `, r]
 }
 
 function mixesNullish(parent: N, child: N) {
@@ -827,12 +896,12 @@ function mixesNullish(parent: N, child: N) {
   return (parent.operator === '??') !== (child.operator === '??')
 }
 
-function signatureNoReturn(n: N, ctx: Ctx) {
-  return typeParams(n.typeParameters, ctx) + params(n.params, ctx)
+function signatureNoReturn(n: N, ctx: Ctx): Doc {
+  return [typeParams(n.typeParameters, ctx), params(n.params, ctx)]
 }
 
-function forLeft(n: N, ctx: Ctx) {
-  return n.type === 'VariableDeclaration' ? print(n, plain(ctx)) : expr(n, plain(ctx), P.CALL)
+function forLeft(n: N): Doc {
+  return n.type === 'VariableDeclaration' ? print(n, PLAIN) : expr(n, PLAIN, P.CALL)
 }
 
 /** Ends with an `if` without `else`, which would capture a following `else`. */
@@ -859,11 +928,9 @@ function hasComputed(n: N): boolean {
 }
 
 /** JSX children are printed verbatim; a comment child becomes `{/* c *\/}`. */
-function jsxChildren(children: N[], ctx: Ctx) {
-  return children
-    .map((c) => {
-      if (!isComment(c)) return print(c, ctx)
-      return c.kind === 'Line' ? `{${comment(c)}\n${ctx.ind}}` : `{${comment(c)}}`
-    })
-    .join('')
+function jsxChildren(children: N[], ctx: Ctx): Doc {
+  return children.map((c) => {
+    if (!isComment(c)) return print(c, ctx)
+    return c.kind === 'Line' ? ['{', comment(c), hardline, '}'] : ['{', comment(c), '}']
+  })
 }

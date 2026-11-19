@@ -6,6 +6,7 @@
 // A replacement from `enter` is walked into (prewalk: its children are visited,
 // it is not entered again); one from `leave` is final (postwalk). Unchanged
 // subtrees are shared: if nothing changed, the result is `===` the input.
+import { originOf, setOrigin } from './origin.ts'
 import { ALIASES, accessor } from './slots.ts'
 import { Node, slotsOf, toNode, withChildren, type Slot } from './node.ts'
 
@@ -64,8 +65,19 @@ function compile(visitor: Visitor): (type: string) => Handlers {
   }
 }
 
-/** A handler's answer: undefined keeps the node. */
-const answer = (r: Result): Node | null | undefined => (r === undefined ? undefined : r === null ? null : toNode(r))
+/**
+ * A handler's answer: undefined keeps the node. A replacement without an origin
+ * takes the origin of the node it replaces (a macro expansion maps to its call).
+ */
+function answer(r: Result, replaced: Node): Node | null | undefined {
+  if (r === undefined || r === null) return r as undefined | null
+  const node = toNode(r)
+  if (node !== replaced && !originOf(node)) {
+    const origin = originOf(replaced)
+    if (origin) setOrigin(node, origin)
+  }
+  return node
+}
 
 /** Ancestors as a linked chain: shared by siblings, valid after the walk too. */
 interface Chain {
@@ -95,7 +107,7 @@ export function walk(root: Node, visitor: Visitor): Node | null {
     }
 
     for (const enter of handlersFor(node.type).enter) {
-      const r = answer(enter(node, ctx))
+      const r = answer(enter(node, ctx), node)
       if (r === null) return null
       if (r !== undefined) {
         node = r
@@ -106,7 +118,7 @@ export function walk(root: Node, visitor: Visitor): Node | null {
     if (!skipped) node = visitChildren(node, up)
 
     for (const leave of handlersFor(node.type).leave) {
-      const r = answer(leave(node, ctx))
+      const r = answer(leave(node, ctx), node)
       if (r === null) return null
       if (r !== undefined) node = r
     }
