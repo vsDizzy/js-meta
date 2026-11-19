@@ -150,6 +150,7 @@ describe('scope', () => {
 })
 
 const KNOWN_GLOBALS = new Set([
+  'assert', // a macro in src/demo/main.js (expanded by src/app.ts before it runs)
   'undefined', 'Infinity', 'NaN', 'Object', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'BigInt', 'Math', 'JSON',
   'Map', 'Set', 'WeakMap', 'WeakSet', 'Promise', 'Error', 'TypeError', 'SyntaxError', 'RegExp', 'Proxy', 'Reflect',
   'console', 'fetch', 'URL', 'performance', 'globalThis', 'Infinity', 'parseInt', 'eval', 'ReferenceError', 'TextEncoder', 'btoa',
