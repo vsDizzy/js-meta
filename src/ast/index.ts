@@ -1,5 +1,6 @@
 export { Node, b, define, toEstree, toNode, slotsOf, type Slot } from './node.ts'
 export { edit } from './edit.ts'
 export { walk, type Ctx, type Visitor, type Handler } from './walk.ts'
+export { scope, freshName, Scope, type ScopeInfo, type Binding, type Reference, type BindingKind, type ScopeKind } from './scope.ts'
 export { originOf, position, type Origin, type SourceFile } from './origin.ts'
 export { SLOTS, ALIASES } from './slots.ts'
