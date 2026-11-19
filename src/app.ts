@@ -17,6 +17,12 @@ const r = await runtime().redefine(url, next)
 console.log(`[meta] redefined counter.js v${r.version}: ${r.changed} form(s) re-run`)
 console.log(`[meta] click() -> ${click()}  (same callback, new label, count kept)`)
 
+// REPL inside the module: its cells and imports are in scope.
+console.log(`[meta] eval in counter.js: inc(); label() -> ${await runtime().eval(url, 'inc(); label()')}`)
+
+// For the DevTools console: await meta.eval('./src/demo/counter.js', 'count')
+Object.assign(globalThis, { meta: runtime() })
+
 for (const rec of runtime().records.values()) {
   const deps = rec.dependencies.map((d) => d.split('/').pop()).join(', ') || '-'
   console.log(`[meta] ${rec.kind.padEnd(6)} v${rec.version} ${rec.url}  deps: ${deps}`)

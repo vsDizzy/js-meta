@@ -17,7 +17,7 @@
 // getters, so nobody has to re-run.
 import { read, type Program } from '../read/index.ts'
 import { emit, emitWithMap, type SourceMap } from '../emit/index.ts'
-import { toNode, type Node } from '../ast/node.ts'
+import { make, toNode, type Node } from '../ast/node.ts'
 import { lower, type Lowered } from './lower.ts'
 
 export type Namespace = Record<string, unknown>
@@ -246,6 +246,45 @@ export class Runtime {
     if (source !== undefined) record.source = source
     record.version++
     return { url, version: record.version, changed: changed.size, removed }
+  }
+
+  // --- REPL -------------------------------------------------------------------------
+
+  private evals = 0
+
+  /**
+   * Runs `code` inside a module, like a REPL in a Clojure namespace, and returns
+   * the value of its last expression statement. The module's bindings and
+   * imports are in scope; new top-level bindings become cells of the module, so
+   * `function inc() {...}` redefines `inc` for every caller. The file itself is
+   * unchanged (a later `redefine` from the file doesn't remove what eval added).
+   */
+  async eval(specifier: string, code: string): Promise<unknown> {
+    const url = this.resolve(specifier)
+    await this.import(url)
+    const record = this.records.get(url)!
+    if (record.kind !== 'source') throw new Error(`js-meta: ${url} is a native module; eval works in modules js-meta reads`)
+    const n = ++this.evals
+    const snippet = read(code, { filename: `${url}?eval=${n}` })
+
+    // The module's imports come along (they only read the loaded namespaces),
+    // and the last expression statement becomes the result.
+    const imports = record.ast!.body.filter((st) => st.type === 'ImportDeclaration')
+    const body = [...snippet.body]
+    const last = body.findLastIndex((st) => st.type !== 'Comment')
+    if (last >= 0 && body[last].type === 'ExpressionStatement' && !body[last].directive) {
+      body[last] = make('ReturnStatement', {}, [body[last].children[0]])
+    }
+    const program = make('Program', { sourceType: 'module' }, [[...imports, ...body]])
+    const lowered = lower(program, { include: (st) => !imports.includes(st), cells: Object.keys(record.env) })
+
+    const { code: js, map } = emitWithMap(lowered.ast)
+    const run = (0, eval)(
+      `${js}//# sourceURL=${url}?eval=${n}#js-meta\n//# sourceMappingURL=data:application/json;base64,${base64(JSON.stringify(map))}\n`,
+    ) as (meta: object, env: object) => Promise<unknown>
+    const value = await run(this.metaFor(record, new Set([url])), record.env)
+    for (const name of lowered.exports) if (!record.exports.includes(name)) record.exports.push(name)
+    return value
   }
 
   // --- phase 2: depth-first evaluation ------------------------------------------

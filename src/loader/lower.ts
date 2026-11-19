@@ -49,6 +49,11 @@ export interface Lowered {
 export interface LowerOptions {
   /** Top-level statements to run (default: all). Exports and imports are always set up. */
   include?: (statement: Node) => boolean
+  /**
+   * Names that are cells already (a module's env, for `runtime.eval`): free
+   * references to them read and write the cell instead of a global.
+   */
+  cells?: Iterable<string>
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -132,6 +137,7 @@ const nameOf = (n: N): string => (n.type === 'Identifier' ? n.name : n.value)
 
 export function lower(program: Node, options: LowerOptions = {}): Lowered {
   const include = options.include ?? (() => true)
+  const known = new Set(options.cells ?? [])
   const info = scope(program)
   const names = new Set(info.names)
   const fresh = (base: string) => {
@@ -240,7 +246,8 @@ export function lower(program: Node, options: LowerOptions = {}): Lowered {
   const read = (n: N): Node | undefined => {
     const imported = importOf(n)
     if (imported) return importRead(imported)
-    if (isCell(info.bindingOf(n))) return cell(n.name)
+    const binding = info.bindingOf(n)
+    if (isCell(binding) || (binding === null && known.has(n.name))) return cell(n.name)
   }
   /** `(0, x.f)`: call without `x` as `this`. */
   const detached = (target: Node) => b.SequenceExpression({ expressions: [b.Literal({ value: 0, raw: '0' }), target] })
@@ -259,7 +266,7 @@ export function lower(program: Node, options: LowerOptions = {}): Lowered {
         const ns = dep(binding.import.source, true)!
         return jsx(binding.import.name === '*' ? [ns] : [ns, binding.import.name])
       }
-      if (isCell(binding)) return jsx([envParam, n.name])
+      if (isCell(binding) || (binding === null && known.has(n.name))) return jsx([envParam, n.name])
     },
     CallExpression(n: N) {
       const target = n.callee.type === 'Identifier' && read(n.callee)

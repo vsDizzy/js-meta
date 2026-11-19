@@ -142,8 +142,40 @@ describe('runtime', () => {
     })
   })
 
-  test('errors name the module', async () => {
-    const { rt } = app({ 'main.js': "import './missing.js'", 'bad.js': 'let = ;' })
+  describe('eval', () => {
+    const counter = "import { step } from './step.js'\nexport let count = 0\nexport function inc() { count += step }"
+    const files = () => ({ 'counter.js': counter, 'step.js': 'export const step = 1' })
+
+    test('reads and writes the module cells and imports; returns the last expression', async () => {
+      const { rt } = app(files())
+      const ns = await rt.import('./counter.js')
+      assert.equal(await rt.eval('./counter.js', 'inc(); inc()\ncount * step'), 2)
+      assert.equal(await rt.eval('./counter.js', 'count = 10'), 10)
+      assert.equal(ns.count, 10, 'importers see it')
+      assert.equal(await rt.eval('./counter.js', 'let x = 1'), undefined)
+    })
+
+    test('a new definition replaces the cell for every caller; new names persist', async () => {
+      const { rt } = app({ ...files(), 'main.js': "import { inc, count } from './counter.js'\nexport const click = () => { inc(); return count }" })
+      const click = (await rt.import('./main.js')).click as () => number
+      const ns = await rt.import('./counter.js')
+      await rt.eval('./counter.js', 'function inc() { count += 100 }\nconst twice = (x) => x * 2')
+      assert.equal(click(), 100, 'callers by name reach the new definition')
+      assert.equal(await rt.eval('./counter.js', 'twice(count)'), 200)
+    })
+
+    test('await, exports, errors', async () => {
+      const { rt } = app(files())
+      const ns = await rt.import('./counter.js')
+      assert.equal(await rt.eval('./counter.js', 'await Promise.resolve(step + 1)'), 2)
+      await rt.eval('./counter.js', 'export const extra = 7')
+      assert.equal(ns.extra, 7)
+      await assert.rejects(rt.eval('./counter.js', 'nope()'), /nope is not defined/)
+      await assert.rejects(rt.eval('./counter.js', 'let = ;'), /counter\.js\?eval=\d+:1/)
+    })
+  })
+
+  test('errors name the module', async () => {    const { rt } = app({ 'main.js': "import './missing.js'", 'bad.js': 'let = ;' })
     await assert.rejects(rt.import('./main.js'), /404 loading http:\/\/app\/missing\.js/)
     await assert.rejects(rt.import('./bad.js'), /http:\/\/app\/bad\.js:1/)
     assert.equal(rt.records.get('http://app/bad.js')!.status, 'failed')
