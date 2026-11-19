@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
 import { describe, test } from 'node:test'
-import { emit } from '../emit/index.ts'
+import { emit, emitWithMap } from '../emit/index.ts'
 import { walk } from '../ast/walk.ts'
 import { read } from '../read/index.ts'
-import { js, match } from './index.ts'
+import { js, match, rule, rules } from './index.ts'
 
 const print = (n: unknown): string => (Array.isArray(n) ? n.map(print).join('\n') : emit(n as never).trimEnd())
 
@@ -116,5 +116,41 @@ describe('match', () => {
       },
     })
     assert.equal(print(out), 'const r = 1 + 2 + (x + (y + 3))')
+  })
+})
+
+describe('rule', () => {
+  test('a template replacement with the same variables; nested forms expand outer first', () => {
+    const ast = read('const r = add(1, 2) + add(x, add(y, 3))')
+    assert.equal(print(walk(ast, rule(js`add($a, $b)`, js`($a + $b)`))), 'const r = 1 + 2 + (x + (y + 3))')
+  })
+
+  test('rules: first that fires wins; a macro may expand into another; null removes', () => {
+    const order: string[] = []
+    const ast = read('log(1)\nconst v = twice(inc(n))\nlog(v)')
+    const out = walk(
+      ast,
+      rules(
+        rule(js`log($$_)`, null),
+        rule(js`twice($x)`, (m) => (order.push('twice'), js`[${m.x}, ${m.x}]`)),
+        rule(js`inc($x)`, (m) => (order.push('inc'), js`plus(${m.x}, 1)`)),
+        rule(js`plus($a, $b)`, js`$a + $b`),
+      ),
+    )
+    assert.equal(print(out), 'const v = [n + 1, n + 1]')
+    assert.deepEqual(order, ['twice', 'inc', 'inc'], 'outer first; the capture expands in each place it is put')
+  })
+
+  test('a function may pass; replacements map to the call site', () => {
+    const ast = read('f(1)\nf(2)', { filename: 'http://x/m.js' })
+    const out = walk(ast, rule(js`f($n)`, (m) => (m.n.value === 2 ? js`g()` : undefined)))!
+    assert.equal(print(out), 'f(1)\ng()')
+    const { map } = emitWithMap(out)
+    assert.ok(map.mappings.includes(';'), 'the second line is mapped')
+  })
+
+  test('mistakes: an uncaptured variable, a rule that never settles', () => {
+    assert.throws(() => walk(read('f(1)'), rule(js`f($a)`, js`g($b)`)), /\$b in a replacement is not captured/)
+    assert.throws(() => walk(read('f(1)'), rule(js`f($a)`, js`f(f($a))`)) && 0, /keep firing/)
   })
 })

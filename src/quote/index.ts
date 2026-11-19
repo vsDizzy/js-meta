@@ -138,39 +138,48 @@ const NAME_SLOTS: Record<string, string[]> = {
 }
 const KEYED = new Set(['Property', 'MethodDefinition', 'PropertyDefinition', 'AccessorProperty'])
 
+/** How holes are spotted and filled: `${}` placeholders for `js`, `$a` variables for `substitute`. */
+interface Holes {
+  /** The hole an identifier name stands for, if any. */
+  key(name: string): string | number | undefined
+  value(key: string | number): unknown
+  /** For messages: `${} #2`, `$a`. */
+  label(key: string | number): string
+  /** For messages: the template. */
+  shown: string
+}
+
 interface Hole {
-  index: number
+  key: string | number
   role: Role
 }
 
 const slotOf = (n: Node, name: string) => n.children[slotsOf(n.type)!.indexOf(name)] ?? null
 
 /** The hole that `node` is, in slot `key` of `parent`; wrapper forms count only where noted. */
-function holeAt(node: Node, parent: Node, key: string, inList: boolean, inPattern: boolean, prefix: string): Hole | undefined {
+function holeAt(node: Node, parent: Node, key: string, inList: boolean, inPattern: boolean, h: Holes): Hole | undefined {
   const index = (n: Slot) =>
-    n && !Array.isArray(n) && (n.type === 'Identifier' || n.type === 'JSXIdentifier') && typeof n.name === 'string' && n.name.startsWith(prefix)
-      ? Number(n.name.slice(prefix.length))
-      : undefined
-  let i: number | undefined
-  if (node.type === 'ExpressionStatement' && !node.directive && (i = index(node.children[0])) !== undefined) return { index: i, role: 'statement' }
+    n && !Array.isArray(n) && (n.type === 'Identifier' || n.type === 'JSXIdentifier') && typeof n.name === 'string' ? h.key(n.name) : undefined
+  let i: string | number | undefined
+  if (node.type === 'ExpressionStatement' && !node.directive && (i = index(node.children[0])) !== undefined) return { key: i, role: 'statement' }
   if (inList) {
-    if (node.type === 'Property' && node.shorthand && (i = index(slotOf(node, 'value'))) !== undefined) return { index: i, role: 'property' }
+    if (node.type === 'Property' && node.shorthand && (i = index(slotOf(node, 'value'))) !== undefined) return { key: i, role: 'property' }
     if (node.type === 'PropertyDefinition' && !node.computed && !node.static && !slotOf(node, 'value') && (i = index(slotOf(node, 'key'))) !== undefined) {
-      return { index: i, role: 'member' }
+      return { key: i, role: 'member' }
     }
-    if (node.type === 'JSXExpressionContainer' && (i = index(node.children[0])) !== undefined) return { index: i, role: 'jsxChild' }
+    if (node.type === 'JSXExpressionContainer' && (i = index(node.children[0])) !== undefined) return { key: i, role: 'jsxChild' }
   }
   if ((i = index(node)) === undefined) return undefined
-  if (node.type === 'JSXIdentifier') return { index: i, role: 'jsxName' }
+  if (node.type === 'JSXIdentifier') return { key: i, role: 'jsxName' }
   const named = NAME_SLOTS[parent.type]?.includes(key) && !(parent.computed && (KEYED.has(parent.type) || parent.type === 'MemberExpression'))
-  return { index: i, role: named || (parent.type === 'Property' && key === 'value' && inPattern) ? 'name' : 'expression' }
+  return { key: i, role: named || (parent.type === 'Property' && key === 'value' && inPattern) ? 'name' : 'expression' }
 }
 
 const PATTERNS = new Set(['ObjectPattern', 'ArrayPattern', 'RestElement', 'AssignmentPattern'])
 
-/** The template's tree with the values put in; untouched subtrees are shared. */
-function fill(t: Template, values: unknown[]): Node | Node[] {
-  const put = (hole: Hole, item: unknown) => coerce(item, hole, t.shown)
+/** `tree` with the holes filled; untouched subtrees are shared. */
+function fill(tree: Node | Node[], h: Holes): Node | Node[] {
+  const put = (hole: Hole, item: unknown) => coerce(item, hole, h)
   const visit = (node: Node, inPattern: boolean): Node => {
     const slots = slotsOf(node.type) ?? []
     let changed = false
@@ -180,7 +189,7 @@ function fill(t: Template, values: unknown[]): Node | Node[] {
       if (Array.isArray(slot)) {
         const out: (Node | null)[] = []
         for (const el of slot) {
-          const hole = el && holeAt(el, node, key, true, pattern, t.prefix)
+          const hole = el && holeAt(el, node, key, true, pattern, h)
           if (!hole) {
             const next = el && visit(el, pattern)
             if (next !== el) changed = true
@@ -188,22 +197,22 @@ function fill(t: Template, values: unknown[]): Node | Node[] {
             continue
           }
           changed = true
-          const v = values[hole.index]
+          const v = h.value(hole.key)
           if (Array.isArray(v)) for (const item of v) out.push(put(hole, item))
           else out.push(put(hole, v))
         }
         return out
       }
       if (!slot) return slot
-      const hole = holeAt(slot, node, key, false, pattern, t.prefix)
+      const hole = holeAt(slot, node, key, false, pattern, h)
       if (!hole) {
         const next = visit(slot, pattern)
         if (next !== slot) changed = true
         return next
       }
       changed = true
-      const v = values[hole.index]
-      if (Array.isArray(v)) throw new TypeError(`\${} #${hole.index + 1} is an array, but it stands where a single node goes, in ${t.shown}`)
+      const v = h.value(hole.key)
+      if (Array.isArray(v)) throw new TypeError(`${h.label(hole.key)} is an array, but it stands where a single node goes, in ${h.shown}`)
       return put(hole, v)
     })
     if (!changed) return node
@@ -218,17 +227,17 @@ function fill(t: Template, values: unknown[]): Node | Node[] {
   }
 
   // The root may itself be a hole: `js\`${x}\``.
-  const root = make('Program', {}, [Array.isArray(t.tree) ? t.tree : [t.tree]])
+  const root = make('Program', {}, [Array.isArray(tree) ? tree : [tree]])
   const body = visit(root, false).children[0] as Node[]
-  if (Array.isArray(t.tree)) return body
-  if (body.length !== 1) throw new TypeError(`\${} spliced ${body.length} nodes where one goes, in ${t.shown}`)
+  if (Array.isArray(tree)) return body
+  if (body.length !== 1) throw new TypeError(`a hole spliced ${body.length} nodes where one goes, in ${h.shown}`)
   return body[0]
 }
 
 const IDENT = /^[\p{ID_Start}$_][\p{ID_Continue}$‌‍]*$/u
 
-function coerce(value: unknown, { index, role }: Hole, shown: string): Node {
-  const where = `\${} #${index + 1} in ${shown}`
+function coerce(value: unknown, { key, role }: Hole, h: Holes): Node {
+  const where = `${h.label(key)} in ${h.shown}`
   if (value === undefined) throw new TypeError(`${where} is undefined`)
   if (typeof value === 'function' || typeof value === 'symbol') throw new TypeError(`${where} is a ${typeof value}, not a node`)
   const isNode = typeof value === 'object' && value !== null && !(value instanceof RegExp)
@@ -325,10 +334,40 @@ export interface Js {
   id(name: string): Node
 }
 
-export const js: Js = Object.assign((strings: TemplateStringsArray, ...values: unknown[]) => fill(template(strings, 'expr'), values) as Node, {
-  stmt: (strings: TemplateStringsArray, ...values: unknown[]) => fill(template(strings, 'stmt'), values) as Node,
-  stmts: (strings: TemplateStringsArray, ...values: unknown[]) => fill(template(strings, 'stmts'), values) as Node[],
+const tag = (mode: Mode) => (strings: TemplateStringsArray, ...values: unknown[]) => {
+  const t = template(strings, mode)
+  return fill(t.tree, {
+    key: (name) => (name.startsWith(t.prefix) ? Number(name.slice(t.prefix.length)) : undefined),
+    value: (i) => values[i as number],
+    label: (i) => `\${} #${(i as number) + 1}`,
+    shown: t.shown,
+  })
+}
+
+export const js: Js = Object.assign(tag('expr') as Js, {
+  stmt: tag('stmt') as Js['stmt'],
+  stmts: tag('stmts') as Js['stmts'],
   id: (name: string) => ident(name),
 })
 
+/** A template written with pattern variables (`js\`($a + $b)\``), with the captures put in. */
+export function substitute(template: Node | Node[], captures: Captures): Node | Node[] {
+  return fill(template, {
+    key: (name) => {
+      const v = variable(name)
+      if (!v) return undefined
+      if (v.name === '_') throw new TypeError(`${name} in a replacement: it matches anything, so there is nothing to put in`)
+      return v.name
+    },
+    value: (name) => {
+      if (!((name as string) in captures)) throw new TypeError(`$${name as string} in a replacement is not captured by the pattern`)
+      return captures[name as string]
+    },
+    label: (name) => `$${name as string}`,
+    shown: 'the replacement',
+  })
+}
+
+import { variable, type Captures } from './match.ts'
 export { match, type Captures } from './match.ts'
+export { rule, rules, type Rule } from './rule.ts'

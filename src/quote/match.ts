@@ -14,10 +14,15 @@ interface Var {
 
 const VAR = /^\$(\$?)([A-Za-z_][\w$]*)$/
 
+/** `$a` -> { name: 'a' }, `$$a` -> { name: 'a', seq: true }. */
+export function variable(name: string): Var | undefined {
+  const m = VAR.exec(name)
+  return m ? { name: m[2], seq: m[1] === '$' } : undefined
+}
+
 function varName(n: Slot): Var | undefined {
   if (!n || Array.isArray(n) || (n.type !== 'Identifier' && n.type !== 'JSXIdentifier') || typeof n.name !== 'string') return undefined
-  const m = VAR.exec(n.name)
-  return m ? { name: m[2], seq: m[1] === '$' } : undefined
+  return variable(n.name)
 }
 
 const slotOf = (n: Node, name: string) => n.children[slotsOf(n.type)!.indexOf(name)] ?? null
