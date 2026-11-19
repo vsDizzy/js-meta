@@ -1,15 +1,24 @@
-// The page: boots the demo app through the js-meta runtime, then redefines one
-// function live and shows that state and handed-out callbacks carry on.
-import { bootstrap, runtime } from './index.ts'
+// The page: boots the demo app through the js-meta runtime with one macro, then
+// redefines a function live, evaluates code inside a module, and lists the graph.
+import { bootstrap, emit, js, rule, rules, runtime, walk } from './index.ts'
+
+// A macro: `assert(cond)` -> a check whose message is the condition's own code.
+const macros = rules(
+  rule(js.stmt`assert($cond)`, (m) => js.stmt`if (!(${m.cond})) throw new Error(${`assertion failed: ${emit(m.cond).trim()}`})`),
+)
 
 const t0 = performance.now()
-const main = await bootstrap(new URL('./demo/main.js', import.meta.url).href)
+const mainUrl = new URL('./demo/main.js', import.meta.url).href
+const main = await bootstrap(mainUrl, { transform: (ast) => walk(ast, macros) })
 const t1 = performance.now()
 console.log(`[meta] booted in ${(t1 - t0).toFixed(1)} ms`)
+const expanded = emit(runtime().records.get(mainUrl)!.ast!).split('\n').find((l) => l.startsWith('if ('))
+console.log(`[meta] assert(...) in main.js expanded to: ${expanded}`)
 
 const click = main.click as () => string
 console.log(`[meta] click() -> ${click()}`)
 
+// Live redefinition: one changed form re-runs, state and handed-out callbacks stay.
 const url = new URL('./demo/counter.js', import.meta.url).href
 const record = runtime().records.get(url)!
 const next = record.source!.replace('`count = ${count}`', '`clicked ${count} times`')

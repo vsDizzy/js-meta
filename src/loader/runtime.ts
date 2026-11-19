@@ -62,6 +62,11 @@ export interface RuntimeOptions {
   nativeImport?: (specifier: string) => Promise<Namespace>
   /** Which URLs we read and lower. Default: same origin as `base`, `.js` or `.mjs`. */
   isSource?: (url: string) => boolean
+  /**
+   * Macros: runs on every module AST after `read`, before lowering (also on
+   * `redefine` and `eval` input). E.g. `(ast) => walk(ast, rules(...))`.
+   */
+  transform?: (ast: Program, url: string) => Node | null
 }
 
 const BARE = /^(?![a-z][a-z0-9+.-]*:|\.{0,2}\/)/i
@@ -81,11 +86,13 @@ export class Runtime {
   private fetchText: NonNullable<RuntimeOptions['fetch']>
   private nativeImport: NonNullable<RuntimeOptions['nativeImport']>
   private isSource: NonNullable<RuntimeOptions['isSource']>
+  private transform: RuntimeOptions['transform']
 
   constructor(options: RuntimeOptions = {}) {
     this.base = options.base ?? globalThis.location?.href ?? 'file:///'
     this.fetchText = options.fetch ?? ((url) => fetch(url))
     this.nativeImport = options.nativeImport ?? ((specifier) => import(specifier))
+    this.transform = options.transform
     const origin = new URL(this.base).origin
     this.isSource = options.isSource ?? ((url) => {
       const u = new URL(url)
@@ -160,7 +167,7 @@ export class Runtime {
       const response = await this.fetchText(url)
       if (!response.ok) throw new Error(`js-meta: ${response.status} loading ${url}`)
       record.source = await response.text()
-      record.ast = read(record.source, { filename: url })
+      record.ast = this.expand(read(record.source, { filename: url }), url)
       this.compile(record, lower(record.ast))
       record.status = 'loaded'
       return record
@@ -169,6 +176,12 @@ export class Runtime {
       record.error = error
       throw error
     }
+  }
+
+  /** The AST after the macros (`transform`): what runs and what `records` keep. */
+  private expand(ast: Program, url: string): Program {
+    if (!this.transform) return ast
+    return (this.transform(ast, url) ?? make('Program', { sourceType: ast.sourceType }, [[]])) as Program
   }
 
   /** Lowered module -> runnable code with an inline source map; records its edges. */
@@ -203,7 +216,7 @@ export class Runtime {
       throw new Error(`js-meta: ${url} is not an evaluated source module`)
     }
     const source = typeof input === 'string' ? input : undefined
-    const ast = (source !== undefined ? read(source, { filename: url }) : toNode(input)) as Program
+    const ast = this.expand((source !== undefined ? read(source, { filename: url }) : toNode(input)) as Program, url)
 
     // Forms by canonical text: the same text means the same form, whatever the layout.
     const form = (n: Node) => (n.type === 'Comment' ? null : emit(n))
@@ -265,7 +278,7 @@ export class Runtime {
     const record = this.records.get(url)!
     if (record.kind !== 'source') throw new Error(`js-meta: ${url} is a native module; eval works in modules js-meta reads`)
     const n = ++this.evals
-    const snippet = read(code, { filename: `${url}?eval=${n}` })
+    const snippet = this.expand(read(code, { filename: `${url}?eval=${n}` }), url)
 
     // The module's imports come along (they only read the loaded namespaces),
     // and the last expression statement becomes the result.

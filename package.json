@@ -1,6 +1,6 @@
 {
   "name": "js-meta",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "devEngines": {
@@ -9,6 +9,9 @@
     }
   },
   "main": "./src/app.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
   "scripts": {
     "dev": "ts-code",
     "test": "node --test --test-timeout=10000 \"src/**/*.test.ts\""
