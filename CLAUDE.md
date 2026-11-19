@@ -26,7 +26,10 @@ A homoiconic runtime for JavaScript: code is data the program can read, change a
   - `walk` visits comments too.
   - Later: an optional JSX API layer for building nodes, and a tagged-template quasiquote (`` js`${a} + ${b}` ``, parsed by our `read`) for macros.
 - **Module system** (planned): a module cache that starts out loaded from ESM, then mirrors the loaded modules live at runtime.
-- **Loader** (planned): rewrites the imports in each `.js` file to point at our module system.
+- **Loader** (in design): rewrites the imports in each `.js` file to point at our module system.
+  - Chosen: our own module format plus a small runtime (like Vite SSR / SystemJS), not native ESM via blob URLs and not a service worker. Modules are records in a registry and exports are getters, so a module can be redefined live (like a Clojure var) and the import graph is live too. The page starts with `bootstrap(entry)`. Every import goes through the runtime's `import()`. Our modules are rewritten; modules we don't parse (esm.sh, bare specifiers, `.ts` for now) are native `import()` wrapped as records.
+  - The per-module object is `import.meta`, the host object ESM already gives each module. Precedent: the standard `import.meta.resolve()`, Vite's `import.meta.hot`, Node's `import.meta.dirname`. Lowering for execution turns static and dynamic imports into `import.meta.import(spec)` and exports into `import.meta.export({ name: () => binding })` at the top of the body (getters: live bindings, ESM-like TDZ, hoisted functions). Then, since `import.meta` is a syntax error outside a native module, `import.meta` becomes the wrapper parameter: `(async function (meta) { ... })`, renamed hygienically (`meta_1`, ...) on a clash. No globals. Runtime extensions also live on `import.meta.*`. The global runtime API (bootstrap, registry, live graph) is exported from the package, not injected.
+  - Users and macros work on canonical ESM (`import`/`export` as written). The lowering is a compile step before execution, visible only in generated code, and source maps hide it.
 
 ## Constraints
 
