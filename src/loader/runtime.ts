@@ -8,14 +8,28 @@
 // in parallel; `evaluate` runs it depth-first, dependencies before importers.
 // Our modules (same origin, .js/.mjs) go through read -> lower -> emit; anything
 // else (bare specifiers, other origins, .ts served by ts-code) is a native
-// import() wrapped as a record. Namespaces of our modules are objects with
-// configurable getters, so a module can later be re-run and importers see the
-// new bindings.
+// import() wrapped as a record.
+//
+// Live redefinition, Clojure style: `redefine(url, source | ast)` compares the
+// new top-level forms with the old ones (by canonical text) and runs only the
+// changed ones into the module's env. Unchanged state stays, callers reach the
+// new definitions through the env cells, and importers read the namespace's
+// getters, so nobody has to re-run.
 import { read, type Program } from '../read/index.ts'
-import { emitWithMap, type SourceMap } from '../emit/index.ts'
-import { lower } from './lower.ts'
+import { emit, emitWithMap, type SourceMap } from '../emit/index.ts'
+import { toNode, type Node } from '../ast/node.ts'
+import { lower, type Lowered } from './lower.ts'
 
 export type Namespace = Record<string, unknown>
+
+export interface Redefinition {
+  url: string
+  version: number
+  /** Top-level forms that were run (new or changed). */
+  changed: number
+  /** Top-level bindings that no longer exist (their cells were removed). */
+  removed: string[]
+}
 
 export interface ModuleRecord {
   url: string
@@ -23,6 +37,12 @@ export interface ModuleRecord {
   kind: 'source' | 'native'
   status: 'loading' | 'loaded' | 'evaluating' | 'evaluated' | 'failed'
   namespace: Namespace
+  /** The module's top-level bindings, one cell per name (source modules). */
+  env: Record<string, unknown>
+  /** Explicitly exported names (the getters this module defined). */
+  exports: string[]
+  /** 1 on first evaluation, +1 per redefinition. */
+  version: number
   /** Resolved URLs of the static imports, in source order. */
   dependencies: string[]
   /** Records that import this one (the reverse edges of the live graph). */
@@ -124,6 +144,9 @@ export class Runtime {
       kind: native ? 'native' : 'source',
       status: 'loading',
       namespace: native ? {} : Object.create(null, { [Symbol.toStringTag]: { value: 'Module' } }),
+      env: Object.create(null),
+      exports: [],
+      version: 0,
       dependencies: [],
       importers: new Set(),
     }
@@ -138,11 +161,7 @@ export class Runtime {
       if (!response.ok) throw new Error(`js-meta: ${response.status} loading ${url}`)
       record.source = await response.text()
       record.ast = read(record.source, { filename: url })
-      const lowered = lower(record.ast)
-      const { code, map } = emitWithMap(lowered.ast)
-      record.code = `${code}//# sourceURL=${url}#js-meta\n//# sourceMappingURL=data:application/json;base64,${base64(JSON.stringify(map))}\n`
-      record.map = map
-      record.dependencies = lowered.imports.map((spec) => this.resolve(spec, url))
+      this.compile(record, lower(record.ast))
       record.status = 'loaded'
       return record
     } catch (error) {
@@ -150,6 +169,83 @@ export class Runtime {
       record.error = error
       throw error
     }
+  }
+
+  /** Lowered module -> runnable code with an inline source map; records its edges. */
+  private compile(record: ModuleRecord, lowered: Lowered) {
+    const { code, map } = emitWithMap(lowered.ast)
+    const tag = record.version ? `#js-meta-v${record.version + 1}` : '#js-meta'
+    record.code = `${code}//# sourceURL=${record.url}${tag}\n//# sourceMappingURL=data:application/json;base64,${base64(JSON.stringify(map))}\n`
+    record.map = map
+    record.exports = lowered.exports
+    record.dependencies = lowered.imports.map((spec) => this.resolve(spec, record.url))
+  }
+
+  // --- live redefinition ----------------------------------------------------------
+
+  private redefinitions = new Map<string, Promise<unknown>>()
+
+  /**
+   * Redefines a module from new source (or a new AST): runs only the top-level
+   * forms that changed, in the same env. Returns what happened.
+   */
+  redefine(url: string, input: string | Node): Promise<Redefinition> {
+    // One at a time per module: each compares against the previous result.
+    const previous = this.redefinitions.get(url) ?? Promise.resolve()
+    const next = previous.catch(() => {}).then(() => this.redefineNow(url, input))
+    this.redefinitions.set(url, next)
+    return next
+  }
+
+  private async redefineNow(url: string, input: string | Node): Promise<Redefinition> {
+    const record = this.records.get(url)
+    if (!record || record.kind !== 'source' || record.status !== 'evaluated') {
+      throw new Error(`js-meta: ${url} is not an evaluated source module`)
+    }
+    const source = typeof input === 'string' ? input : undefined
+    const ast = (source !== undefined ? read(source, { filename: url }) : toNode(input)) as Program
+
+    // Forms by canonical text: the same text means the same form, whatever the layout.
+    const form = (n: Node) => (n.type === 'Comment' ? null : emit(n))
+    const before = new Map<string, number>()
+    for (const n of record.ast!.body) {
+      const k = form(n)
+      if (k !== null) before.set(k, (before.get(k) ?? 0) + 1)
+    }
+    const changed = new Set<Node>()
+    for (const n of ast.body) {
+      const k = form(n)
+      if (k === null) continue
+      const left = before.get(k) ?? 0
+      if (left > 0) before.set(k, left - 1)
+      else changed.add(n)
+    }
+
+    const oldBindings = lower(record.ast!).bindings
+    const oldExports = record.exports
+    const oldDeps = record.dependencies
+    const lowered = lower(ast, { include: (n) => changed.has(n) })
+    this.compile(record, lowered)
+
+    // Cells and exports that no longer exist go away.
+    const removed = oldBindings.filter((name) => !lowered.bindings.includes(name))
+    for (const name of removed) delete record.env[name]
+    for (const name of oldExports) if (!lowered.exports.includes(name)) delete record.namespace[name]
+
+    // The live graph follows the new imports.
+    for (const dep of oldDeps) if (!record.dependencies.includes(dep)) this.records.get(dep)?.importers.delete(url)
+    for (const dep of record.dependencies) {
+      await this.loadGraph(dep)
+      this.records.get(dep)!.importers.add(url)
+      await this.evaluate(this.records.get(dep)!, new Set([url]))
+    }
+
+    const body = (0, eval)(record.code!) as (meta: object, env: object) => Promise<void>
+    await body(this.metaFor(record, new Set([url])), record.env)
+    record.ast = ast
+    if (source !== undefined) record.source = source
+    record.version++
+    return { url, version: record.version, changed: changed.size, removed }
   }
 
   // --- phase 2: depth-first evaluation ------------------------------------------
@@ -171,9 +267,10 @@ export class Runtime {
     record.status = 'evaluating'
     try {
       for (const dep of record.dependencies) await this.evaluate(this.records.get(dep)!, ancestors)
-      const body = (0, eval)(record.code!) as (meta: object) => Promise<void>
-      await body(this.metaFor(record, ancestors))
+      const body = (0, eval)(record.code!) as (meta: object, env: object) => Promise<void>
+      await body(this.metaFor(record, ancestors), record.env)
       record.status = 'evaluated'
+      record.version = 1
     } catch (error) {
       record.status = 'failed'
       record.error = error

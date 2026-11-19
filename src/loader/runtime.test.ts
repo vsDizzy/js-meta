@@ -81,6 +81,67 @@ describe('runtime', () => {
     assert.equal((globalThis as any).runs, 1)
   })
 
+  describe('redefine', () => {
+    const counter = "export let count = 0\nexport function inc() { count++ }\nexport function label() { return 'n=' + count }"
+    const files = () => ({
+      'counter.js': counter,
+      'main.js': "import { inc, label } from './counter.js'\nexport const click = () => { inc(); return label() }",
+    })
+
+    test('changing one function keeps the state; importers and old callbacks see it', async () => {
+      const { rt } = app(files())
+      const main = await rt.import('./main.js')
+      const click = main.click as () => string // a callback handed out before the change
+      assert.equal(click(), 'n=1')
+      const r = await rt.redefine('http://app/counter.js', counter.replace("'n=' + count", "'count: ' + count"))
+      assert.deepEqual(r, { url: 'http://app/counter.js', version: 2, changed: 1, removed: [] })
+      assert.equal(click(), 'count: 2', 'new label, count kept going')
+    })
+
+    test('a changed initializer re-runs (like def); layout-only changes run nothing', async () => {
+      const { rt } = app(files())
+      const ns = await rt.import('./counter.js')
+      ;(ns.inc as () => void)()
+      const relaid = await rt.redefine('http://app/counter.js', counter.replaceAll(' ', '  ').replace('{', '{\n'))
+      assert.equal(relaid.changed, 0)
+      assert.equal(ns.count, 1)
+      await rt.redefine('http://app/counter.js', counter.replace('count = 0', 'count = 10'))
+      assert.equal(ns.count, 10)
+    })
+
+    test('removed bindings and exports go away', async () => {
+      const { rt } = app(files())
+      const ns = await rt.import('./counter.js')
+      const r = await rt.redefine('http://app/counter.js', "export let count = 0\nexport function inc() { count++ }")
+      assert.deepEqual(r.removed, ['label'])
+      assert.equal('label' in ns, false)
+      assert.equal('label' in rt.records.get('http://app/counter.js')!.env, false)
+    })
+
+    test('side effects run again only when their form changed', async () => {
+      const g = globalThis as any
+      g.effects = 0
+      const src = "globalThis.effects++\nexport const v = 1"
+      const { rt } = app({ 'fx.js': src })
+      await rt.import('./fx.js')
+      await rt.redefine('http://app/fx.js', src.replace('v = 1', 'v = 2'))
+      assert.equal(g.effects, 1)
+      await rt.redefine('http://app/fx.js', src.replace('effects++', 'effects += 10'))
+      assert.equal(g.effects, 11)
+    })
+
+    test('a new import is loaded and joins the live graph; an AST works as input', async () => {
+      const { rt } = app({ ...files(), 'extra.js': 'export const bonus = 100' })
+      const main = await rt.import('./main.js')
+      const next = "import { inc, label } from './counter.js'\nimport { bonus } from './extra.js'\nexport const click = () => { inc(); return label() + bonus }"
+      const { read } = await import('../read/index.ts')
+      await rt.redefine('http://app/main.js', read(next, { filename: 'http://app/main.js' }))
+      assert.equal((main.click as () => string)(), 'n=1100')
+      assert.ok(rt.records.get('http://app/extra.js')!.importers.has('http://app/main.js'))
+      assert.deepEqual(rt.records.get('http://app/main.js')!.dependencies, ['http://app/counter.js', 'http://app/extra.js'])
+    })
+  })
+
   test('errors name the module', async () => {
     const { rt } = app({ 'main.js': "import './missing.js'", 'bad.js': 'let = ;' })
     await assert.rejects(rt.import('./main.js'), /404 loading http:\/\/app\/missing\.js/)

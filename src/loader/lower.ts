@@ -1,30 +1,40 @@
 // lower(ast): canonical ESM -> a function the runtime can run. A compile step
 // before execution; users and macros keep working on canonical ESM.
 //
-//   import d, { a } from './b.js'          (async function (meta) {
-//   export const c = a + d                    'use strict'
-//   export default c * 2                      meta.export({ c: () => c, default: () => _default })
-//   import.meta.url; import('./x.js')   ->    const b = await meta.import('./b.js')
-//                                             const c = b.a + b.default
-//                                             const _default = c * 2
-//                                             meta.url; meta.import('./x.js')
+//   import d, { a } from './b.js'          (async function (meta, env) {
+//   export let count = 0                      'use strict'
+//   export function inc() { count++ }         meta.export({ count: () => env.count, inc: () => env.inc, default: () => env.default })
+//   export default inc                        env.inc = function inc() { env.count++ }
+//   a(d)                               ->     const b = await meta.import('./b.js')
+//                                             env.count = 0
+//                                             env.default = env.inc
+//                                             ;(0, b.a)(b.default)
 //                                           })
 //
-// - Exports are registered first, as getters: live bindings, TDZ like ESM, and
-//   other modules (cycles too) read them through the runtime's records.
-// - Uses of imported names become reads of the module's namespace: `a` -> `b.a`,
-//   `a()` -> `(0, b.a)()` (no `this`), `{ a }` -> `{ a: b.a }`, `<A />` -> `<b.A />`.
-// - `import.meta` -> the wrapper's parameter, `import(x)` -> `meta.import(x)`.
-// - New names (`meta`, namespaces, `_default`) are fresh: no clash with the module's.
-// Plain JS only for now: JSX and TS types are left as they are.
-import { b } from '../ast/node.ts'
+// Top-level bindings live in `env`, the module's environment: one cell per name,
+// like Clojure vars. Every use goes through the cell, so redefining one form
+// (re-running just it into the same env) leaves the rest of the state alone and
+// every caller sees the new value. `include` picks the forms to run: all of them
+// on first load, only the changed ones on a redefinition (runtime.ts).
+//
+// - Exports are registered first, as getters over `env`: live bindings that other
+//   modules (cycles too) read through the runtime's records.
+// - Function declarations are hoisted (assigned first), as in ESM.
+// - Imported names read the dependency's namespace: `a` -> `b.a`, `a()` ->
+//   `(0, b.a)()` (no `this`), `{ a }` -> `{ a: b.a }`, `<A />` -> `<b.A />`.
+// - `import.meta` -> the `meta` parameter, `import(x)` -> `meta.import(x)`.
+// - New names (`meta`, `env`, namespaces) are fresh; `env.default` can't clash
+//   with a binding since `default` is a reserved word.
+// Known gap: no TDZ for top-level let/const (a cell reads undefined before its
+// initializer runs). Plain JS only for now: JSX and TS types are left as they are.
+import { b, make, type Node } from '../ast/node.ts'
 import { edit } from '../ast/edit.ts'
-import { walk } from '../ast/walk.ts'
+import { originOf, setOrigin } from '../ast/origin.ts'
+import { walk, type Ctx } from '../ast/walk.ts'
 import { freshName, scope, type Binding } from '../ast/scope.ts'
-import type { Node } from '../ast/node.ts'
 
 export interface Lowered {
-  /** A Program with one statement: the `(async function (meta) { ... })` wrapper. */
+  /** A Program with one statement: the `(async function (meta, env) { ... })` wrapper. */
   ast: Node
   /** Static dependencies in source order, as written (`./b.js`). */
   imports: string[]
@@ -32,6 +42,13 @@ export interface Lowered {
   exports: string[]
   /** Whether the module re-exports everything of some dependency (`export * from`). */
   exportsAll: boolean
+  /** Names of the module's top-level bindings (its env cells), imports excluded. */
+  bindings: string[]
+}
+
+export interface LowerOptions {
+  /** Top-level statements to run (default: all). Exports and imports are always set up. */
+  include?: (statement: Node) => boolean
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -48,10 +65,21 @@ const member = (object: Node, name: string) =>
     : b.MemberExpression({ object, property: str(name), computed: true, optional: false })
 const call = (callee: Node, args: Node[]) => b.CallExpression({ callee, arguments: args, optional: false })
 const stmt = (expression: Node) => b.ExpressionStatement({ expression })
+const assign = (left: Node, right: Node) => b.AssignmentExpression({ operator: '=', left, right })
 const getter = (body: Node) =>
   b.ArrowFunctionExpression({ params: [], body, async: false, expression: true, generator: false, id: null })
 const constant = (name: string, init: Node) =>
   b.VariableDeclaration({ kind: 'const', declare: false, declarations: [b.VariableDeclarator({ id: id(name), init, definite: false })] })
+const voidZero = () => b.UnaryExpression({ operator: 'void', prefix: true, argument: b.Literal({ value: 0, raw: '0' }) })
+
+/** Same children and attrs under another type (declaration <-> expression), keeping the origin. */
+function retype(n: N, type: string): Node {
+  const { type: _, children, ...attrs } = n
+  const out = make(type, attrs, children)
+  const origin = originOf(n)
+  if (origin) setOrigin(out, origin)
+  return out
+}
 
 /** `./utils/foo-bar.js` -> `foo_bar`, `@scope/pkg` -> `pkg`. */
 function baseName(source: string): string {
@@ -82,9 +110,28 @@ function patternNames(p: N, out: string[] = []): string[] {
   return out
 }
 
+/** A declarator id after the rewrite: env cells (members) instead of names. */
+function holdsCells(p: N): boolean {
+  switch (p?.type) {
+    case 'MemberExpression':
+      return true
+    case 'ObjectPattern':
+      return p.properties.some((prop: N) => holdsCells(prop.type === 'RestElement' ? prop.argument : prop.value))
+    case 'ArrayPattern':
+      return p.elements.some((el: N) => el && holdsCells(el))
+    case 'AssignmentPattern':
+      return holdsCells(p.left)
+    case 'RestElement':
+      return holdsCells(p.argument)
+    default:
+      return false
+  }
+}
+
 const nameOf = (n: N): string => (n.type === 'Identifier' ? n.name : n.value)
 
-export function lower(program: Node): Lowered {
+export function lower(program: Node, options: LowerOptions = {}): Lowered {
+  const include = options.include ?? (() => true)
   const info = scope(program)
   const names = new Set(info.names)
   const fresh = (base: string) => {
@@ -93,6 +140,12 @@ export function lower(program: Node): Lowered {
     return name
   }
   const param = fresh('meta')
+  const envParam = fresh('env')
+  const cell = (name: string) => member(id(envParam), name)
+
+  /** A top-level binding of the module (an env cell), not an import. */
+  const isCell = (binding: Binding | null | undefined): binding is Binding =>
+    !!binding && binding.scope === info.root && !binding.import && binding.kind !== 'enum'
 
   /** source -> namespace variable (null: imported for side effects only). */
   const deps = new Map<string, string | null>()
@@ -120,6 +173,7 @@ export function lower(program: Node): Lowered {
   const body: Node[] = []
 
   for (const st of (program as N).body as N[]) {
+    const run = include(st)
     switch (st.type) {
       case 'ImportDeclaration': {
         if (st.importKind === 'type') break
@@ -132,9 +186,9 @@ export function lower(program: Node): Lowered {
         if (st.declaration) {
           const d = st.declaration
           if (d.declare || /^TS(Interface|TypeAlias|Declare|Module)/.test(d.type)) break
-          body.push(d)
+          if (run) body.push(d)
           const declared = d.type === 'VariableDeclaration' ? d.declarations.flatMap((x: N) => patternNames(x.id)) : [d.id.name]
-          for (const name of declared) exports.set(name, getter(id(name)))
+          for (const name of declared) exports.set(name, getter(cell(name)))
           break
         }
         const specs = st.specifiers.filter((s: N) => s.type === 'ExportSpecifier' && s.exportKind !== 'type')
@@ -144,7 +198,7 @@ export function lower(program: Node): Lowered {
         } else {
           for (const s of specs) {
             const binding = info.bindingOf(s.local)
-            exports.set(nameOf(s.exported), getter(binding?.import ? importRead(binding) : id(s.local.name)))
+            exports.set(nameOf(s.exported), getter(binding?.import ? importRead(binding) : cell(s.local.name)))
           }
         }
         break
@@ -159,55 +213,73 @@ export function lower(program: Node): Lowered {
       case 'ExportDefaultDeclaration': {
         const d = st.declaration
         if (/^TS/.test(d.type)) break
-        if (d.type === 'FunctionDeclaration' || d.type === 'ClassDeclaration') {
-          const named = d.id ? d : edit(d, (draft: N) => void (draft.id = id(fresh('_default'))))
-          body.push(named)
-          exports.set('default', getter(id((named as N).id.name)))
+        const named = (d.type === 'FunctionDeclaration' || d.type === 'ClassDeclaration') && d.id
+        if (named) {
+          if (run) body.push(d)
+          exports.set('default', getter(cell(d.id.name)))
         } else {
-          const name = fresh('_default')
-          body.push(constant(name, d))
-          exports.set('default', getter(id(name)))
+          const value = d.type === 'FunctionDeclaration' ? retype(d, 'FunctionExpression') : d.type === 'ClassDeclaration' ? retype(d, 'ClassExpression') : d
+          if (run) body.push(stmt(assign(cell('default'), value)))
+          exports.set('default', getter(cell('default')))
         }
         break
       }
       default:
-        body.push(st)
+        if (run) body.push(st)
     }
   }
 
-  // --- uses of imports, import.meta, import() --------------------------------
+  // --- names: cells, imports, import.meta, import() -------------------------
+  const top = b.BlockStatement({ body })
+  const hoisted: Node[] = []
   const importOf = (n: N): Binding | undefined => {
     const binding = info.bindingOf(n)
     return binding?.import && binding.declarations[0] !== n ? binding : undefined
   }
-  /** `(0, ns.a)`: call an import without `ns` as `this`. */
-  const detached = (binding: Binding) =>
-    binding.import!.name === '*' ? importRead(binding) : b.SequenceExpression({ expressions: [b.Literal({ value: 0, raw: '0' }), importRead(binding)] })
+  /** What a name reads as: a cell, an import, or itself (undefined). */
+  const read = (n: N): Node | undefined => {
+    const imported = importOf(n)
+    if (imported) return importRead(imported)
+    if (isCell(info.bindingOf(n))) return cell(n.name)
+  }
+  /** `(0, x.f)`: call without `x` as `this`. */
+  const detached = (target: Node) => b.SequenceExpression({ expressions: [b.Literal({ value: 0, raw: '0' }), target] })
+  /** The name of a function or class stays a name. */
+  const isOwnName = (ctx: Ctx) => ctx.key === 'id' && /^(Function|Class)(Declaration|Expression)$/.test(ctx.parent?.type ?? '')
 
   const rewrite = {
-    Identifier(n: N) {
-      const binding = importOf(n)
-      if (binding) return importRead(binding)
+    Identifier(n: N, ctx: Ctx) {
+      if (!isOwnName(ctx)) return read(n)
     },
     JSXIdentifier(n: N) {
-      const binding = importOf(n)
-      if (!binding) return
-      const ns = dep(binding.import!.source, true)!
-      if (binding.import!.name === '*') return b.JSXIdentifier({ name: ns })
-      return b.JSXMemberExpression({ object: b.JSXIdentifier({ name: ns }), property: b.JSXIdentifier({ name: binding.import!.name }) })
+      const binding = info.bindingOf(n)
+      const jsx = (path: string[]): Node =>
+        path.slice(1).reduce<Node>((object, name) => b.JSXMemberExpression({ object, property: b.JSXIdentifier({ name }) }), b.JSXIdentifier({ name: path[0] }))
+      if (binding?.import && binding.declarations[0] !== n) {
+        const ns = dep(binding.import.source, true)!
+        return jsx(binding.import.name === '*' ? [ns] : [ns, binding.import.name])
+      }
+      if (isCell(binding)) return jsx([envParam, n.name])
     },
     CallExpression(n: N) {
-      const binding = n.callee.type === 'Identifier' && importOf(n.callee)
-      if (binding) return edit(n, (d: N) => void (d.callee = detached(binding)))
+      const target = n.callee.type === 'Identifier' && read(n.callee)
+      if (target && !(n.callee.type === 'Identifier' && importOf(n.callee)?.import?.name === '*')) {
+        return edit(n, (d: N) => void (d.callee = detached(target)))
+      }
     },
     TaggedTemplateExpression(n: N) {
-      const binding = n.tag.type === 'Identifier' && importOf(n.tag)
-      if (binding) return edit(n, (d: N) => void (d.tag = detached(binding)))
+      const target = n.tag.type === 'Identifier' && read(n.tag)
+      if (target) return edit(n, (d: N) => void (d.tag = detached(target)))
     },
-    Property(n: N, ctx: N) {
-      if (!n.shorthand || ctx.parent?.type !== 'ObjectExpression') return
-      const binding = importOf(n.value)
-      if (binding) return edit(n, (d: N) => void ((d.shorthand = false), (d.value = importRead(binding))))
+    Property(n: N, ctx: Ctx) {
+      if (!n.shorthand || !/^Object(Expression|Pattern)$/.test(ctx.parent?.type ?? '')) return
+      const value = n.value.type === 'AssignmentPattern' ? n.value.left : n.value
+      const target = read(value)
+      if (!target) return
+      return edit(n, (d: N) => {
+        d.shorthand = false
+        d.value = n.value.type === 'AssignmentPattern' ? edit(n.value, (p: N) => void (p.left = target)) : target
+      })
     },
     MetaProperty(n: N) {
       if (n.meta.name === 'import' && n.property.name === 'meta') return id(param)
@@ -215,8 +287,36 @@ export function lower(program: Node): Lowered {
     ImportExpression(n: N) {
       return call(member(id(param), 'import'), n.options ? [n.source, n.options] : [n.source])
     },
+    // Declarations of cells become assignments to them.
+    VariableDeclaration: {
+      leave(n: N, ctx: Ctx) {
+        const decls = n.declarations.filter((d: N) => d.type === 'VariableDeclarator')
+        if (!decls.length || !holdsCells(decls[0].id)) return
+        if (ctx.key === 'left') return decls[0].id // for (env.x of xs)
+        // `var x` alone keeps the cell; `let x` resets it.
+        const parts = decls
+          .filter((d: N) => d.init || n.kind !== 'var')
+          .map((d: N) => assign(d.id, d.init ?? voidZero()))
+        const expr = parts.length === 1 ? parts[0] : b.SequenceExpression({ expressions: parts })
+        if (ctx.key === 'init') return parts.length ? expr : null // for (env.i = 0; ...)
+        return parts.length ? stmt(expr) : null
+      },
+    },
+    FunctionDeclaration: {
+      leave(n: N, ctx: Ctx) {
+        if (ctx.parent !== top || !isCell(info.bindingOf(n.id))) return
+        hoisted.push(stmt(assign(cell(n.id.name), retype(n, 'FunctionExpression'))))
+        return null
+      },
+    },
+    ClassDeclaration: {
+      leave(n: N, ctx: Ctx) {
+        if (ctx.parent !== top || !n.id || !isCell(info.bindingOf(n.id))) return
+        return stmt(assign(cell(n.id.name), retype(n, 'ClassExpression')))
+      },
+    },
   }
-  const rewritten = (walk(b.BlockStatement({ body }), rewrite) as N).body as Node[]
+  const rewritten = (walk(top, rewrite) as N).body as Node[]
 
   // --- the wrapper ----------------------------------------------------------
   const head: Node[] = [b.ExpressionStatement({ expression: str('use strict'), directive: 'use strict' })]
@@ -226,6 +326,7 @@ export function lower(program: Node): Lowered {
     )
     head.push(stmt(call(member(id(param), 'export'), [b.ObjectExpression({ properties: props })])))
   }
+  head.push(...hoisted)
   for (const [source, ns] of deps) {
     const load = b.AwaitExpression({ argument: call(member(id(param), 'import'), [str(source)]) })
     head.push(ns ? constant(ns, load) : stmt(load))
@@ -234,17 +335,19 @@ export function lower(program: Node): Lowered {
 
   const fn = b.FunctionExpression({
     id: null,
-    params: [id(param)],
+    params: [id(param), id(envParam)],
     body: b.BlockStatement({ body: [...head, ...rewritten] }),
     async: true,
     generator: false,
     expression: false,
     declare: false,
   })
+  const bindings = [...info.root.bindings.values()].filter(isCell).map((x) => x.name)
   return {
     ast: b.Program({ sourceType: 'script', body: [stmt(fn)] }),
     imports: [...deps.keys()],
     exports: [...exports.keys()],
     exportsAll: exportAll.length > 0,
+    bindings,
   }
 }

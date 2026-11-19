@@ -14,7 +14,7 @@ const bodyOf = (src: string, filename?: string) =>
     .map((l) => l.slice(2))
     .join('\n')
 
-/** A minimal registry, just enough to run lowered modules (the real runtime comes next). */
+/** A minimal registry, just enough to run lowered modules (runtime.ts is the real one). */
 async function run(modules: Record<string, string>, entry: string) {
   const records = new Map<string, Record<string, unknown>>()
   const load = async (url: string): Promise<Record<string, unknown>> => {
@@ -34,7 +34,7 @@ async function run(modules: Record<string, string>, entry: string) {
       },
     }
     const fn = (0, eval)(emit(lower(read(modules[url], { filename: url })).ast))
-    await fn(meta)
+    await fn(meta, Object.create(null))
     return ns
   }
   return load(entry)
@@ -46,12 +46,12 @@ describe('lower: output', () => {
     assert.equal(
       out(src),
       [
-        '(async function (meta) {',
+        '(async function (meta, env) {',
         "  'use strict'",
-        '  meta.export({ c: () => c, default: () => _default })',
+        '  meta.export({ c: () => env.c, default: () => env.default })',
         "  const b = await meta.import('./b.js')",
-        '  const c = b.a + b.default',
-        '  const _default = c * 2',
+        '  env.c = b.a + b.default',
+        '  env.default = env.c * 2',
         '  meta.url',
         "  meta.import('./x.js')",
         '})',
@@ -60,18 +60,48 @@ describe('lower: output', () => {
     )
   })
 
+  test('top-level bindings are env cells; locals stay locals', () => {
+    const src = 'let n = 0\nfunction inc(by = 1) { const next = n + by; n = next; return n }\nclass C { m() { return inc() } }\nfor (var i = 0; i < 2; i++) inc()'
+    assert.equal(
+      bodyOf(src),
+      [
+        'env.inc = function inc(by = 1) {',
+        '  const next = env.n + by',
+        '  env.n = next',
+        '  return env.n',
+        '}',
+        'env.n = 0',
+        'env.C = class C {',
+        '  m() {',
+        '    return (0, env.inc)()',
+        '  }',
+        '}',
+        'for (env.i = 0; env.i < 2; env.i++) (0, env.inc)()',
+      ].join('\n'),
+    )
+  })
+
+  test('destructuring declarations assign to cells', () => {
+    // `;`: right after the 'use strict' directive, `(` would make a call of it.
+    assert.equal(bodyOf('const { a, b: [c] = [], ...rest } = obj'), ';({ a: env.a, b: [env.c] = [], ...env.rest } = obj)')
+    assert.equal(bodyOf('let x, y = 1\nvar z'), 'env.x = void 0, env.y = 1')
+  })
+
   test('calls lose `this`, shorthand gets a value, JSX gets a member', () => {
     // `;` before `(`: the printer keeps it ASI-safe after `const m = ...`.
     assert.equal(bodyOf("import { f } from './m.js'\nf(1)\nf`t`"), "const m = await meta.import('./m.js')\n;(0, m.f)(1)\n;(0, m.f)`t`")
-    assert.equal(bodyOf("import { a } from './m.js'\nx({ a })"), "const m = await meta.import('./m.js')\nx({ a: m.a })")
-    assert.equal(bodyOf("import A from './m.js'\nconst v = <A x={1} />", 'http://x/a.jsx'), "const m = await meta.import('./m.js')\nconst v = <m.default x={1} />")
+    assert.equal(bodyOf("import { a } from './m.js'\nconst b = 1\nx({ a, b })"), "const m = await meta.import('./m.js')\nenv.b = 1\nx({ a: m.a, b: env.b })")
+    assert.equal(
+      bodyOf("import A from './m.js'\nconst B = 1\nconst v = <A x={B}><B /></A>", 'http://x/a.jsx'),
+      "const m = await meta.import('./m.js')\nenv.B = 1\nenv.v = <m.default x={env.B}><env.B /></m.default>",
+    )
   })
 
-  test('namespaces, shadowing, side-effect imports in order', () => {
+  test('namespaces, shadowing, hoisting, side-effect imports in order', () => {
     const src = "import './polyfill.js'\nimport * as u from './u.js'\nfunction f(u) { return u }\nu.g(u)"
     assert.equal(
       bodyOf(src),
-      "await meta.import('./polyfill.js')\nconst u_1 = await meta.import('./u.js')\n\nfunction f(u) {\n  return u\n}\n\nu_1.g(u_1)",
+      "env.f = function f(u) {\n  return u\n}\nawait meta.import('./polyfill.js')\nconst u_1 = await meta.import('./u.js')\nu_1.g(u_1)",
     )
   })
 
@@ -80,22 +110,33 @@ describe('lower: output', () => {
     const lowered = lower(read(src, { filename: 'http://x/m.js' }))
     assert.deepEqual(lowered.exports, ['key', 'a', 'y', 'ns'])
     assert.deepEqual(lowered.imports, ['./a.js', './x.js', './all.js', './n.js'])
+    assert.deepEqual(lowered.bindings, ['k'])
     assert.equal(lowered.exportsAll, true)
     // The namespace of './a.js' is `a_1`: the module already has an `a`.
-    assert.match(emit(lowered.ast), /meta\.export\(\{ key: \(\) => k, a: \(\) => a_1\.a, y: \(\) => x\.x, ns: \(\) => n \}\)/)
+    assert.match(emit(lowered.ast), /meta\.export\(\{ key: \(\) => env\.k, a: \(\) => a_1\.a, y: \(\) => x\.x, ns: \(\) => n \}\)/)
     assert.match(emit(lowered.ast), /meta\.exportAll\(all\)/)
   })
 
-  test('default function and class keep or get a name', () => {
-    assert.match(out('export default function () {}'), /function _default\(\) \{\}/)
-    assert.match(out('export default class K {}'), /meta\.export\(\{ default: \(\) => K \}\)/)
+  test('default exports', () => {
+    assert.match(out('export default function () {}'), /env\.default = function \(\) \{\}/)
+    assert.match(out('export default class K {}'), /meta\.export\(\{ default: \(\) => env\.K \}\)/)
+    assert.match(out('export default class K {}'), /env\.K = class K \{\}/)
   })
 
   test('fresh names never clash with the module', () => {
-    const src = "import { a } from './b.js'\nconst meta = 1, b = 2\nexport { meta, b }\na"
+    const src = "import { a } from './b.js'\nconst meta = 1, b = 2, env = 3\nexport { meta, b }\na"
     assert.equal(
       bodyOf(src),
-      "meta_1.export({ meta: () => meta, b: () => b })\nconst b_1 = await meta_1.import('./b.js')\nconst meta = 1, b = 2\nb_1.a",
+      "meta_1.export({ meta: () => env_1.meta, b: () => env_1.b })\nconst b_1 = await meta_1.import('./b.js')\nenv_1.meta = 1, env_1.b = 2, env_1.env = 3\nb_1.a",
+    )
+  })
+
+  test('include: run only some forms; exports and imports are always set up', () => {
+    const ast = read("import { a } from './a.js'\nexport let n = 0\nexport function f() { return a }", { filename: 'http://x/m.js' })
+    const onlyF = lower(ast, { include: (st) => st === (ast.body[2] as unknown) })
+    assert.equal(
+      emit(onlyF.ast).split('\n').slice(2, -2).map((l) => l.slice(2)).join('\n'),
+      "meta.export({ n: () => env.n, f: () => env.f })\nenv.f = function f() {\n  return a_1.a\n}\nconst a_1 = await meta.import('./a.js')",
     )
   })
 
@@ -140,17 +181,15 @@ describe('lower: semantics (run with a stub registry)', () => {
     assert.equal(main.ab, 'ba')
   })
 
-  test('TDZ: reading a binding before it is initialized throws', async () => {
-    await assert.rejects(
-      run(
-        {
-          'http://x/a.js': "import { early } from './b.js'\nexport const value = 1",
-          'http://x/b.js': "import { value } from './a.js'\nexport const early = value",
-        },
-        'http://x/a.js',
-      ),
-      ReferenceError,
+  test('known gap: no TDZ, a binding read before its initializer is undefined', async () => {
+    const a = await run(
+      {
+        'http://x/a.js': "import { early } from './b.js'\nexport const value = 1\nexport const seen = early",
+        'http://x/b.js': "import { value } from './a.js'\nexport const early = value",
+      },
+      'http://x/a.js',
     )
+    assert.equal(a.seen, undefined) // ESM would throw a ReferenceError in b.js
   })
 
   test('default, namespace, re-exports, import.meta.url, dynamic import', async () => {
