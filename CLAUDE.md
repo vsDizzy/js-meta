@@ -2,6 +2,8 @@
 
 A homoiconic runtime for JavaScript: code is data the program can read, change and print back.
 
+**Guiding principle:** client ergonomics first. Working with code-as-data should feel like a breath of fresh air, not a chore. Clojure is the reference for homoiconicity, translated into what is canonical for JS.
+
 ## Pieces
 
 - **read** (`src/read/`, done): `read(source, { sourceType, filename })` returns an AST.
@@ -10,7 +12,16 @@ A homoiconic runtime for JavaScript: code is data the program can read, change a
   - Comments are nodes (`{type:'Comment', kind, value}`) placed in the nearest list, right before their owner. There is one canonical rule and no layout flags.
   - `filename` is a module URL.
 - **emit** (`src/emit/`, done): `emit(ast)` returns code in one canonical style: no semicolons (ASI-safe), no line wrapping, literals printed from `raw`. It is round-trip stable: `read(emit(ast))` deep-equals `ast`, and `emit` reaches a fixed point after one pass.
-- **Client API with `walk`** (planned): traversing and transforming the AST.
+- **Client API with `walk`** (in design): traversing and transforming code.
+  - Data form: an object `{ type, ...attrs, children }`, in the JS-canonical model of type + attributes + ordered children (JSX/DOM/unist). Children are positional slots: `null` for an empty slot, an array for a list of nodes (`children: [id, [a, b], body]`). Order lives in the structure, so `walk` is generic and needs no visitor-keys table.
+  - Named access: one class per node type, with getters/setters mapping names to slots (`node.left` ↔ `children[0]`). `JSON.stringify` still gives the plain form. Builders (`b.binary('+', a, b)`) create class instances; `walk` also accepts bare objects, since it only needs `children`.
+  - Immutable values outside, JS-style mutation inside a scoped `edit(ast, draft => { ... })` (like Clojure transients / Immer). Setters copy-on-write the node and its path to the root inside `edit`, and throw a helpful error outside it. Untouched subtrees stay `===` (structural sharing → cheap change detection and per-subtree `emit` caching). Copies inherit `originOf`. No `Object.freeze`.
+  - Transform `walk` is postwalk-style: return a node to replace, `null` to remove, nothing to keep.
+  - No `node.parent`: with structural sharing a node can have several parents, so context comes from the traversal. The callback gets `(node, ctx)`: `ctx.parent`, `ctx.key` (slot name), `ctx.index`, `ctx.ancestors`, `ctx.prev`/`ctx.next` (list siblings, handy for comments), `ctx.skip()`. Scope analysis is separate and lazy. A zipper (`cursor(ast)`) is possible later.
+  - Visitor: `walk(ast, fn | visitor)`. A function is enter-for-all. An object has keys by type, group aliases (`Function` first, defined in the slot table), `{ enter, leave }` per key, and generic `enter`/`leave`. `walk` returns the new root (`===` if unchanged). A replacement from `leave` is postwalk; one from `enter` is prewalk (descend into the replacement's children without re-entering it, so nested macros expand with no loops). Selectors and visitor merging come later.
+  - ESTree objects stay as the boundary with the outside world: the parser produces them and `emit` consumes them. The ESTree ↔ children conversion holds the only per-type slot table.
+  - `walk` visits comments too.
+  - Later: an optional JSX API layer for building nodes, and a tagged-template quasiquote (`` js`${a} + ${b}` ``, parsed by our `read`) for macros.
 - **Module system** (planned): a module cache that starts out loaded from ESM, then mirrors the loaded modules live at runtime.
 - **Loader** (planned): rewrites the imports in each `.js` file to point at our module system.
 
