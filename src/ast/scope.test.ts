@@ -152,5 +152,5 @@ describe('scope', () => {
 const KNOWN_GLOBALS = new Set([
   'undefined', 'Infinity', 'NaN', 'Object', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'BigInt', 'Math', 'JSON',
   'Map', 'Set', 'WeakMap', 'WeakSet', 'Promise', 'Error', 'TypeError', 'SyntaxError', 'RegExp', 'Proxy', 'Reflect',
-  'console', 'fetch', 'URL', 'performance', 'globalThis', 'Infinity', 'parseInt',
+  'console', 'fetch', 'URL', 'performance', 'globalThis', 'Infinity', 'parseInt', 'eval', 'ReferenceError',
 ])
