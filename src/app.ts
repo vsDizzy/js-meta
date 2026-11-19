@@ -1,15 +1,11 @@
 // The page: boots the demo app through the js-meta runtime with one macro, then
 // redefines a function live, evaluates code inside a module, and lists the graph.
-import { bootstrap, emit, js, rule, rules, runtime, walk } from './index.ts'
-
-// A macro: `assert(cond)` -> a check whose message is the condition's own code.
-const macros = rules(
-  rule(js.stmt`assert($cond)`, (m) => js.stmt`if (!(${m.cond})) throw new Error(${`assertion failed: ${emit(m.cond).trim()}`})`),
-)
+import { transform } from './demo/macros.ts'
+import { bootstrap, emit, runtime } from './index.ts'
 
 const t0 = performance.now()
 const mainUrl = new URL('./demo/main.js', import.meta.url).href
-const main = await bootstrap(mainUrl, { transform: (ast) => walk(ast, macros) })
+const main = await bootstrap(mainUrl, { transform })
 const t1 = performance.now()
 console.log(`[meta] booted in ${(t1 - t0).toFixed(1)} ms`)
 const expanded = emit(runtime().records.get(mainUrl)!.ast!).split('\n').find((l) => l.startsWith('if ('))

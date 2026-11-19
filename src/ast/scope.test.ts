@@ -3,6 +3,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { describe, test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { transform } from '../demo/macros.ts'
 import { read } from '../read/index.ts'
 import { freshName, scope, walk, type Node } from './index.ts'
 
@@ -138,7 +139,9 @@ describe('scope', () => {
       )
     for (const file of filesIn(SRC)) {
       test(relative(SRC, file), () => {
-        const ast = read(readFileSync(file, 'utf8'), { filename: file.replaceAll('\\', '/') })
+        const source = read(readFileSync(file, 'utf8'), { filename: file.replaceAll('\\', '/') })
+        // The demo is checked as it runs: with its macros expanded.
+        const ast = /[\\/]demo[\\/]/.test(file) ? transform(source)! : source
         const info = scope(ast)
         // Every reference lands on a binding with its name; the only free names are globals.
         for (const r of info.references) if (r.binding) assert.equal(r.binding.name, (r.node as any).name)
@@ -150,7 +153,6 @@ describe('scope', () => {
 })
 
 const KNOWN_GLOBALS = new Set([
-  'assert', // a macro in src/demo/main.js (expanded by src/app.ts before it runs)
   'undefined', 'Infinity', 'NaN', 'Object', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'BigInt', 'Math', 'JSON',
   'Map', 'Set', 'WeakMap', 'WeakSet', 'Promise', 'Error', 'TypeError', 'SyntaxError', 'RegExp', 'Proxy', 'Reflect',
   'console', 'fetch', 'URL', 'performance', 'globalThis', 'Infinity', 'parseInt', 'eval', 'ReferenceError', 'TextEncoder', 'btoa',

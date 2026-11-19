@@ -5,7 +5,7 @@ import { greet } from './greet.ts'
 const before = count
 inc()
 inc()
-// `assert` is a macro (src/app.ts): it expands to a check that quotes its own code.
+// `assert` is a macro (src/demo/macros.ts): it expands to a check that quotes its own code.
 assert(count === before + 2)
 console.log(`[demo] ${greet('js-meta')}: count ${before} -> ${count} (live binding)`)
 console.log(`[demo] import.meta.url = ${import.meta.url}`)
