@@ -189,3 +189,47 @@ Reverses "Rejected for now: line comments in place" in the entry above.
 - **Rejected:** `$$a` as code only (the old behaviour). A rule `{ $$body }` → `{ $$body }` stripped the comments from the body.
 - **Rejected:** a greedy `$$` comment variable. It takes the gap between its neighbours' matches, so `/* $$a */ /* @x */ /* $$b */` has one answer.
 - **Rejected:** an error when a replacement moves a sibling comment. It is a documented copy until `walk` can replace the comments before a node.
+
+### Two-layer match: what the core looks like
+
+From the research in `specs/two-layer-match-research.md` (in Russian). The low-level matcher is not built yet; these are the agreed constraints for it.
+
+- **Chosen:** one node model for all families, the one we have: `{ type, ...attrs, children }`. An S-expression is a node with one list slot. The current `match` already handles such nodes unchanged.
+- **Chosen:** kinds carry a family prefix (`lua/CallExpression`, `clj/list`); ESTree stays bare. Six of eight Lua type names tried collide with ESTree in the one slot table.
+- **Rejected:** a slot table per family. A mixed tree would need to know which table each node belongs to.
+- **Chosen:** in the `js` sugar a rule's head is matched by name, as today. Resolving the head through its binding is an explicit option of the low level.
+- **Rejected:** binding resolution by default in `js`. It is the correct behaviour (a shadowed macro expands today), but it changes what existing rules do.
+- **Chosen:** low-level patterns match partially (fields not mentioned are ignored, as in tree-sitter queries); `js` patterns stay exact.
+- **Chosen:** three oddities of `match` get fixed, each with a new test: a type annotation on a pattern variable is silently dropped, `value` is ignored on any atom that is not a `Literal`, `declare` is ignored.
+- **Deferred:** a speed threshold. The baseline is in the research document.
+- **Chosen:** cljs and Lisp forms are Nodes, atoms included. `walk`, `edit` and `originOf` then work on them as they are, and the family adapter is needed only by `match`.
+- **Rejected:** native values (numbers, strings, persistent lists). Origins live in a WeakMap, which takes no primitives, and `walk` and `edit` would have to go through the adapter too.
+
+### Two-layer match: patterns are trees with `pat/` nodes
+
+The design is in `specs/two-layer-match-design.md` (in Russian).
+
+- **Chosen:** a pattern is an ordinary tree in which nodes of the `pat/` family may stand (`pat/bind`, `pat/rep`, `pat/or`, ...). A plain node in a pattern is a literal and matches exactly; `pat/node` checks the kind and matches partially. The `js` sugar turns `$a`, `$$a` and the wrapper forms into `pat/` nodes once per pattern.
+- **Rejected:** patterns as a separate data type (`{ p: 'bind', ... }`). A literal node could not hold such objects in its `children`, so a pattern could not embed code, and `walk` could not traverse it.
+- **Rejected:** an `exact` flag on every pattern. The kind of the pattern node already says which mode is meant.
+- **Chosen:** `or` is an ordered choice: the first alternative that fits is taken for good. Backtracking stays inside one list, as before.
+- **Rejected:** full backtracking across nodes. None of the rules collected for the five languages needs it.
+- **Chosen:** a family is picked by the prefix of the node type; its table holds what `match` needs to know (ignored attributes, atom equality, equivalent kinds, the statement that wraps an expression, the head for the index). `Comment` is one kind shared by all families.
+- **Chosen:** a child is expanded before its parent's rule decides through `ctx.expand(node)`, called from a guard or a replacement function.
+- **Deferred:** expansion inside the pattern itself (nanopass's `,[e]`), and moving `substitute` onto the core's `build`.
+- **Chosen:** resolving a rule's head through its binding is an option of the rule (`{ from: { source, name } }`).
+- **Accepted cost:** `ctx.scope` is a snapshot of the tree the walk started with. A node made by a template is not in it, and its head is resolved by name.
+
+### Two-layer match: as built
+
+Differences from the design, found while building it.
+
+- **Chosen:** a `'use strict'` directive is still matched by an expression pattern, as before. The design's `unwrap` excluded directives, which would have been a third behaviour change next to `value` and `declare`.
+- **Chosen:** a head made by a template is resolved in the nearest enclosing scope the snapshot knows, not at module level. A `from` rule that expands into another `from` rule would otherwise never fire.
+- **Chosen:** the `position` hook also gets the parent's ctx. ESTree cannot tell a `Property.value` in an object from one in an object pattern without it.
+- **Chosen:** `pat/node` kinds go through the family's `canon`, like literals, and a `pat/node` is compared with what a statement wraps when none of its kinds accepts the statement itself.
+- **Chosen:** the index looks under the target's kind and under everything it unwraps to. It is a filter that may let a rule through for the matcher to refuse, never the reverse.
+- **Chosen:** a rule whose expression pattern fired on a wrapping statement puts its result back into the same kind of statement, through the family's `unwrap`. It was hardcoded for `ExpressionStatement`, so a Lua call statement became a bare expression in a statement list.
+- **Chosen:** a rule's replacement template may hold `pat/` nodes; they are filled by `build` after `substitute`. Before, they were left in the result without an error.
+- **Chosen:** `ctx.freshName(base)`. `freshName(base, ctx.scope.names)` gives the same name twice in one walk, because the scope is a snapshot.
+

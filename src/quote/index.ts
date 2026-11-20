@@ -145,7 +145,7 @@ function checkStrings(tree: Node | Node[], prefix: string, shown: string) {
 
 // --- where a hole stands, and what a value becomes there ---
 
-type Role = 'expression' | 'name' | 'statement' | 'property' | 'member' | 'jsxChild' | 'jsxName'
+type Role = 'expression' | 'name' | 'statement' | 'property' | 'member' | 'jsxChild' | 'jsxName' | 'type'
 
 /** Slots where only a name (or pattern) can stand; a string there is an identifier. */
 const NAME_SLOTS: Record<string, string[]> = {
@@ -187,6 +187,8 @@ interface Holes {
   label(key: string | number): string
   /** For messages: the template. */
   shown: string
+  /** Gets the nodes put in for holes, as they stand in the result. */
+  placed?: Set<Node>
 }
 
 interface Hole {
@@ -202,6 +204,8 @@ function holeAt(node: Node, parent: Node, key: string, inList: boolean, inPatter
     n && !Array.isArray(n) && (n.type === 'Identifier' || n.type === 'JSXIdentifier') && typeof n.name === 'string' ? h.key(n.name) : undefined
   let i: string | number | undefined
   if (node.type === 'ExpressionStatement' && !node.directive && (i = index(node.children[0])) !== undefined) return { key: i, role: 'statement' }
+  // A type that is a lone name holds any type: `x as ${t}`, `A | $$Ts`.
+  if (node.type === 'TSTypeReference' && !slotOf(node, 'typeArguments') && (i = index(slotOf(node, 'typeName'))) !== undefined) return { key: i, role: 'type' }
   if (inList) {
     if (node.type === 'Property' && node.shorthand && (i = index(slotOf(node, 'value'))) !== undefined) return { key: i, role: 'property' }
     if (node.type === 'PropertyDefinition' && !node.computed && !node.static && !slotOf(node, 'value') && (i = index(slotOf(node, 'key'))) !== undefined) {
@@ -309,7 +313,9 @@ function fill(tree: Node | Node[], h: Holes): Node | Node[] {
           // `read` gives them (and a line comment can only be printed there).
           // Not in the template's own root, which is a single node.
           const siblings = node !== root || Array.isArray(tree)
-          out.push(...(siblings && !NO_COMMENT_LISTS.has(node.type) ? items.flatMap((n) => [...leadOf(n), setLead(n, [])]) : items))
+          const spliced = siblings && !NO_COMMENT_LISTS.has(node.type) ? items.flatMap((n) => [...leadOf(n), setLead(n, [])]) : items
+          for (const n of spliced) h.placed?.add(n)
+          out.push(...spliced)
         }
         return out
       }
@@ -323,7 +329,9 @@ function fill(tree: Node | Node[], h: Holes): Node | Node[] {
       changed = true
       const v = h.value(hole.key)
       if (Array.isArray(v)) throw new TypeError(`${h.label(hole.key)} is an array, but it stands where a single node goes, in ${h.shown}`)
-      return withLead(slot, put(hole, v))
+      const filled = withLead(slot, put(hole, v))
+      h.placed?.add(filled)
+      return filled
     })
     if (!changed) return node
     const attrs = attrsOf(node)
@@ -388,6 +396,11 @@ function coerce(value: unknown, { key, role }: Hole, h: Holes): Node {
       if (node?.type === 'Identifier') return make('JSXIdentifier', { name: node.name }, [])
       if (node && /^JSX(Identifier|MemberExpression|NamespacedName)$/.test(node.type)) return node
       throw new TypeError(`${where}: not a JSX name`)
+    case 'type':
+      // A name is a reference to it; any other node goes in as it is.
+      if (node?.type === 'Identifier' || node?.type === 'TSQualifiedName') return make('TSTypeReference', {}, [node, null])
+      if (node) return node
+      throw new TypeError(`${where} is ${value === null ? 'null' : value instanceof RegExp ? 'a RegExp' : `a ${typeof value}`}, not a type node`)
   }
 }
 
@@ -465,8 +478,17 @@ export const js: Js = Object.assign(tag('expr') as Js, {
 })
 
 /** A template written with pattern variables (`js\`($a + $b)\``), with the captures put in. */
+export function substitute(template: Node, captures: Captures): Node
+export function substitute(template: Node[], captures: Captures): Node[]
+export function substitute(template: Node | Node[], captures: Captures): Node | Node[]
 export function substitute(template: Node | Node[], captures: Captures): Node | Node[] {
+  return substituteTracking(template, captures)
+}
+
+/** Internal, for `rule`: `substitute`, adding to `placed` the nodes it put in for variables. */
+export function substituteTracking(template: Node | Node[], captures: Captures, placed?: Set<Node>): Node | Node[] {
   return fill(template, {
+    placed,
     key: (name) => {
       const v = variable(name)
       if (!v) return undefined
@@ -484,4 +506,4 @@ export function substitute(template: Node | Node[], captures: Captures): Node | 
 
 import { commentName, variable, type Captures } from './match.ts'
 export { match, type Captures, type MatchContext } from './match.ts'
-export { rule, rules, type Rule } from './rule.ts'
+export { rule, rules, type Rule, type RuleOptions } from './rule.ts'

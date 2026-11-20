@@ -212,7 +212,8 @@ export function scope(ast: Node): ScopeInfo {
     if (n.superClass) visit(n.superClass, s)
     const c = open('class', n, s)
     if (n.type === 'ClassExpression' && n.id) declare(n.id, 'class', c)
-    for (const m of n.body.body) visit(m, c)
+    if (n.body?.type === 'ClassBody') for (const m of n.body.body) visit(m, c)
+    else visit(n.body, c)
   }
 
   /** Class members and object properties: the key is a name unless computed. */
@@ -235,7 +236,9 @@ export function scope(ast: Node): ScopeInfo {
   }
 
   function visit(n: N, s: Scope): void {
-    if (TYPE_ONLY.has(n.type)) return
+    // Nodes of other families (`lua/...`) go through `children`; where one stands
+    // in an ESTree node, a field read by name may be missing: nothing to visit.
+    if (!n || TYPE_ONLY.has(n.type)) return
     switch (n.type) {
       case 'Comment':
       case 'Literal':

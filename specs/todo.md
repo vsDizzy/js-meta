@@ -23,3 +23,25 @@ Future work, not scheduled. Each item says what is wanted and, where known, how 
 
 - `class A { @dec /* c */ m() {} }`: a comment after a decorator prints in front of `@`, where it reads back as a class-body comment.
 - A JSDoc cast with a line break before the parenthesis (`/** @type {T} */`, new line, `(x).foo()`) is read as a list comment and loses its parentheses. See the decision log for why the cast rule needs the same line.
+
+## Rules: what the acceptance tests found awkward
+
+Found on 2026-11-20 while writing `src/match/acceptance.test.ts`.
+
+1. **A rule cannot turn one node into several.** A handler returns one node or null, so "one statement becomes two" (Lua `local function`) has to match the enclosing list with runs before and after, name every kind that has a statement list, and fires once per occurrence (over 100 in one list hits the repeat limit). Fix: let a `walk` handler return an array to splice into the list. The same change lets a rule replace the comments before its node (see the comments section above).
+2. **Expanding a node's own children.** `ctx.expand(node)` on the rule's own node re-enters the rule; the optional-chaining rules guard with `env`. Fix: `ctx.expandChildren()`.
+3. **"Optional or not" in the sugar.** `?.` is an attribute, so `a.b`, `a[k]` and `a?.b` each need a rule (most of the 11 rules for optional chaining). The core can say it with `p.node`; the sugar has no syntax for an attribute that may vary.
+4. **No "stop here" result.** Lisp `quote` is a rule that never fires and calls `ctx.skip()`.
+5. **`read` with a `.js` filename accepts TS syntax**, so re-reading as `.js` does not prove the output is plain JS.
+6. **Speed.** A rule whose key is only a kind (`$o.name`, operators) is tried at every node of that kind, and a failed try costs about 350-400 ns. A cheap root check before `matchPattern`, and a finer key for member patterns, would cut it.
+
+## Pattern core: left out
+
+- Expanding a child inside the pattern itself (nanopass's `,[e]`); today it is `ctx.expand` in a guard or a replacement function.
+- `substitute` on top of `build`.
+- Wrapper forms for `interface { $$m }`, `enum { $$m }`, `import { $$s }`, `<$T $$attrs />`, `const $$d`.
+- `p.or` and `p.not` in a list work per element: an alternative cannot be a group or a run.
+- `ctx.scope` is a snapshot: a name bound by a template is unknown to it (waits on hygiene).
+- Readers and printers for cljs, Lisp and Lua.
+- A `pat/` node put into a `js` template through `${}` works only where an expression goes; as a statement it gets wrapped, as a property, class member or JSX child it throws. `coerce` could pass `pat/` nodes through in every role.
+- A function replacement that returns `null` passes instead of removing the node (`replace(...) ?? undefined` in `rule`); only a `null` replacement removes. Older than the two-layer work.

@@ -94,14 +94,15 @@ function toSlot(value: unknown): Slot {
 
 /**
  * `comments`, the leading comments of a node: an attribute that holds Comment
- * nodes (never a slot). Converted like children; empty or absent is absent, so
- * trees compare equal however they were built.
+ * nodes (never a slot), or in a pattern comment variables (`pat/comment`).
+ * Converted like children; empty or absent is absent, so trees compare equal
+ * however they were built.
  */
 function setComments(attrs: Record<string, unknown>, value: unknown) {
   delete attrs.comments
   if (value === null || value === undefined) return
   const comments = Array.isArray(value) ? value.map((c) => toNode(c)) : []
-  if (!Array.isArray(value) || comments.some((c) => c.type !== 'Comment')) {
+  if (!Array.isArray(value) || comments.some((c) => c.type !== 'Comment' && c.type !== 'pat/comment')) {
     throw new TypeError(`comments: a list of Comment nodes, not ${JSON.stringify(value)}`)
   }
   if (comments.length) attrs.comments = comments
