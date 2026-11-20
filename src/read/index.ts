@@ -1,6 +1,7 @@
 // read(source) -> AST: nodes `{ type, ...attrs, children }` (ast/node.ts) for
-// ESTree types and JSX included, with comments as `Comment` nodes in lists and
-// positions in a side table (ast/origin.ts).
+// ESTree types and JSX included, with comments as `Comment` nodes in lists (or
+// in a node's `comments` attribute, see comments.ts) and positions in a side
+// table (ast/origin.ts).
 import { make, Node, slotsOf, type Slot } from '../ast/node.ts'
 import { setOrigin, position, type SourceFile } from '../ast/origin.ts'
 import { attachComments, childKeys, isNode } from './comments.ts'
@@ -95,6 +96,11 @@ function toAst(node: EsNode, file: SourceFile): Node {
     }
     return isNode(value) ? toAst(value, file) : null
   })
+  // Leading comments (comments.ts): an attribute holding Comment nodes, not a slot.
+  // Program's own `comments` is the parser's raw list, already placed.
+  if (node.type !== 'Program' && Array.isArray(node.comments)) {
+    attrs.comments = (node.comments as EsNode[]).map((c) => toAst(c, file))
+  }
   const out = make(node.type, attrs, children)
   setOrigin(out, { file, start: node.range[0], end: node.range[1] })
   return out

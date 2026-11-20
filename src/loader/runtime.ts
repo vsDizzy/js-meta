@@ -11,13 +11,14 @@
 // import() wrapped as a record.
 //
 // Live redefinition, Clojure style: `redefine(url, source | ast)` compares the
-// new top-level forms with the old ones (by canonical text) and runs only the
-// changed ones into the module's env. Unchanged state stays, callers reach the
-// new definitions through the env cells, and importers read the namespace's
-// getters, so nobody has to re-run.
+// new top-level forms with the old ones (by canonical text, comments aside) and
+// runs only the changed ones into the module's env. Unchanged state stays,
+// callers reach the new definitions through the env cells, and importers read
+// the namespace's getters, so nobody has to re-run.
 import { read, type Program } from '../read/index.ts'
 import { emit, emitWithMap, type SourceMap } from '../emit/index.ts'
 import { make, toNode, type Node } from '../ast/node.ts'
+import { walk } from '../ast/walk.ts'
 import { lower, type Lowered } from './lower.ts'
 
 export type Namespace = Record<string, unknown>
@@ -218,8 +219,9 @@ export class Runtime {
     const source = typeof input === 'string' ? input : undefined
     const ast = this.expand((source !== undefined ? read(source, { filename: url }) : toNode(input)) as Program, url)
 
-    // Forms by canonical text: the same text means the same form, whatever the layout.
-    const form = (n: Node) => (n.type === 'Comment' ? null : emit(n))
+    // Forms by canonical text without comments: the same text means the same
+    // form, whatever the layout and comments (editing a comment runs nothing).
+    const form = (n: Node) => (n.type === 'Comment' ? null : emit(walk(n, { Comment: () => null })!))
     const before = new Map<string, number>()
     for (const n of record.ast!.body) {
       const k = form(n)

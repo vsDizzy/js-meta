@@ -45,8 +45,8 @@ function varOf(p: Node, inList: boolean): Var | undefined {
 const kind = (type: string) =>
   type === 'FunctionDeclaration' ? 'FunctionExpression' : type === 'ClassDeclaration' ? 'ClassExpression' : type
 
-/** Attrs that don't change what the code means. */
-const IGNORED = new Set(['raw', 'shorthand', 'value', 'regex', 'bigint', 'expression', 'declare'])
+/** Attrs that don't change what the code means (`comments`: leading comments). */
+const IGNORED = new Set(['raw', 'shorthand', 'value', 'regex', 'bigint', 'expression', 'declare', 'comments'])
 const isDefault = (v: unknown) => v === undefined || v === null || v === false || (Array.isArray(v) && v.length === 0)
 
 function sameAttrs(p: Node, t: Node): boolean {

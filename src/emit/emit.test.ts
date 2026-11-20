@@ -84,10 +84,65 @@ describe('emit: comments', () => {
     ['export default (class {}).name', 'export default (class {}).name'],
     ['f(a,\n /* end */\n)', 'f(\n  a,\n  /* end */\n)'],
     ['function g() { /* inner */ }', 'function g() {\n  /* inner */\n}'],
-    ['if (/* c */ x) y()', '/* c */\nif (x) y()'],
+    ['if (/* c */ x) y()', 'if (/* c */ x) y()'],
     ['<a>{/* c */}</a>', '<a>{/* c */}</a>'],
     ['a()\n// tail', 'a()\n// tail'],
   ])
+})
+
+describe('emit: leading comments', () => {
+  /** Exact output, plus both round-trip properties on it. */
+  const leading: [src: string, out: string, filename?: string][] = [
+    ['if (/* c */ a == 0) b()', 'if (/* c */ a == 0) b()'],
+    ['const x = /* @__PURE__ */ f()', 'const x = /* @__PURE__ */ f()'],
+    ['import(/* webpackChunkName: "x" */ "./x.js")', 'import(/* webpackChunkName: "x" */ "./x.js")'],
+    ['x = /* c */ a + b', 'x = /* c */ a + b'],
+    ['a + /* why */ b', 'a + /* why */ b'],
+    ['function f(a) /* x */ {}', 'function f(a) /* x */ {}'],
+    ['if (x /* c */) y()', 'if (x) /* c */ y()'],
+    ['`${/* c */ x}`', '`${/* c */ x}`'],
+    ['f(/* timeout */ 100)', 'f(/* timeout */ 100)'],
+    // Line comments hoist as before (this layout is the existing one for a line comment in `let a, b`).
+    ['const x = a + // why\n b', 'const \n  // why\n  x = a + b\n'],
+    ['x = a + // why\n b', '// why\nx = a + b'],
+    ['x = /* a */ /* b */ y', 'x = /* a */ /* b */ y'],
+    // A comment at the start of its parent's text stays inside parens.
+    ['(/* c */ a) + b', '(/* c */ a) + b'],
+    ['(/* c */ a + b) * 2', '(/* c */ a + b) * 2'],
+    ['(/* c */ f())', '(/* c */ f())'],
+    ['(/* c */ a).b()', '(/* c */ a).b()'],
+    ['(/* c */ function () {})()', '(/* c */ function () {})()'],
+    ['a()\n;(/* c */ b).c()', 'a()\n;(/* c */ b).c()'],
+    ['x = (/* c */ a ?? b) || c', 'x = (/* c */ a ?? b) || c'],
+    ['type A = (/* c */ T)[]', 'type A = (/* c */ T)[]', 'a.ts'],
+    // Checks on how a text starts see through comments.
+    ['export default (/* c */ function () {})', 'export default (/* c */ function () {})'],
+    ['export default /* c */ function () {}', 'export default /* c */ function () {}'],
+    ['let f = () => (/* c */ {})', 'let f = () => (/* c */ {})'],
+    ['let f = () => /* c */ {}', 'let f = () => /* c */ {}'],
+    ['- /* c */ -x', '- /* c */ -x'],
+    ['import { a as /* c */ a } from "x"', 'import { a as /* c */ a } from "x"'],
+    // A line break after `return` would end the statement.
+    ['function g() { return (/* a\n b */ x) }', 'function g() {\n  return (/* a\n b */ x)\n}'],
+    ['function g() { return /* a */ x }', 'function g() {\n  return /* a */ x\n}'],
+    // Children printed in parts.
+    ['class A { m /* c */ () /* d */ {} }', 'class A {\n  m /* c */ () /* d */ {}\n}'],
+    ['let f = (a) => /* c */ a', 'let f = (a) => /* c */ a'],
+    ['let x /* c */ : T', 'let x /* c */ : T', 'a.ts'],
+    ['function f /* c */ <T>() {}', 'function f /* c */ <T>() {}', 'a.ts'],
+    ['type F = (a) /* c */ => R', 'type F = (a) /* c */ => R', 'a.ts'],
+    ['let x = <a>{/* c */ y}</a>', 'let x = <a>{/* c */ y}</a>'],
+    ['let x = <a></ /* c */ a>', 'let x = <a></ /* c */ a>'],
+  ]
+  for (const [src, out, filename = 'input.js'] of leading) {
+    test(JSON.stringify(src), () => {
+      const ast = read(src, { filename })
+      const code = emit(ast)
+      assert.equal(code, out + '\n')
+      assert.deepEqual(read(code, { filename }), ast, 'read(emit(ast)) must equal ast')
+      assert.equal(emit(read(code, { filename })), code, 'emit must be a fixed point')
+    })
+  }
 })
 
 describe('emit: nodes built by hand', () => {
@@ -123,6 +178,25 @@ describe('emit: nodes built by hand', () => {
 
   test('unknown node type is an error', () => {
     assert.throws(() => emit({ type: 'Nope' }), /unknown node type "Nope"/)
+  })
+
+  test('leading comments: printed before the node, in parens where it starts its parent', () => {
+    const c = (value: string, kind = 'Block') => ({ type: 'Comment', kind, value })
+    const id = (name: string, comments?: object[]) => ({ type: 'Identifier', name, comments })
+    const pure = { type: 'CallExpression', callee: id('f'), arguments: [], optional: false, comments: [c(' @__PURE__ ')] }
+    const decl = {
+      type: 'VariableDeclaration',
+      kind: 'const',
+      declarations: [{ type: 'VariableDeclarator', id: id('x'), init: pure }],
+    }
+    assert.equal(emit(decl), 'const x = /* @__PURE__ */ f()')
+    assert.equal(emit({ type: 'BinaryExpression', operator: '+', left: id('a', [c(' c ')]), right: id('b') }), '(/* c */ a) + b')
+    assert.equal(emit({ type: 'ExpressionStatement', expression: pure }), '(/* @__PURE__ */ f())')
+  })
+
+  test('a Line comment cannot lead a node', () => {
+    const ast = { type: 'Identifier', name: 'a', comments: [{ type: 'Comment', kind: 'Line', value: ' c' }] }
+    assert.throws(() => emit(ast), /a Line comment can't lead Identifier/)
   })
 })
 

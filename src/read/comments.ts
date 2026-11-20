@@ -8,9 +8,16 @@
 //     comma (`x = 1 // note`, `f(a /* a */, b)`) -> the previous element;
 //   - otherwise -> the next element (`f(a, /* b */ b)`);
 //   - no next element -> stays at the end of the list.
-// A comment inside an element but in no list of its own (`if (/* c */ x)`) belongs
-// to that element. The layout of a comment (same line or not) is not stored: after
-// one read/emit round the result is a fixed point.
+// A block comment in no list (`if (/* c */ a == 0)`, `x = /* @__PURE__ */ f()`)
+// stays in place: it leads the node right after it, the next child of the
+// deepest node around it, and goes into that node's `comments` attribute (a
+// list of Comment nodes, not a slot). So the owner is the outermost node that
+// starts after the comment: in `x = /* c */ a + b` the sum, not `a`. Template
+// literal text (quasis) never takes one. Any other comment (a line comment, or
+// one with nothing after it) belongs to the enclosing element and moves before
+// it: a `//` inside an expression would need a line break there. The layout of a
+// comment (same line or not) is not stored: after one read/emit round the
+// result is a fixed point.
 import type { EsNode, RawComment } from './parser.ts'
 
 export interface EsComment extends EsNode {
@@ -29,11 +36,14 @@ export const isNode = (value: unknown): value is EsNode =>
   typeof (value as EsNode).type === 'string' &&
   Array.isArray((value as EsNode).range)
 
-/** Keys of `node` that hold children (skips positions and Program's own comments/tokens). */
+/**
+ * Keys of `node` that hold children. Skips positions, Program's own tokens, and
+ * `comments`: the parser's list on Program, leading comments (an attribute) elsewhere.
+ */
 export function* childKeys(node: EsNode) {
   for (const key of Object.keys(node)) {
-    if (SKIP_KEYS.has(key)) continue
-    if (node.type === 'Program' && (key === 'comments' || key === 'tokens')) continue
+    if (SKIP_KEYS.has(key) || key === 'comments') continue
+    if (node.type === 'Program' && key === 'tokens') continue
     yield key
   }
 }
@@ -123,6 +133,12 @@ function place(node: EsNode, comment: EsComment, text: string): boolean {
   // `{ /* only */ }`, `[ /* only */ ]`: the node is just brackets around one list.
   if (!hasFieldChild && lists.length === 1) {
     lists[0].push(comment)
+    return true
+  }
+  // In no list: a block comment leads the next child (`test`, `right`, a template
+  // expression). Not template text: the comment would end up inside the string.
+  if (comment.kind === 'Block' && next && !next.list && next.node.type !== 'TemplateElement') {
+    ;((next.node.comments ??= []) as EsComment[]).push(comment)
     return true
   }
   return false

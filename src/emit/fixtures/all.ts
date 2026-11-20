@@ -78,4 +78,9 @@ const generic = <T,>(x: T): T => x
 function assertIsString(x: unknown): asserts x is string {}
 let fnType: <T>(x: T) => T
 let opt: { a?: number } | undefined
+let led: /* type */ string
+type Arrow = (a: number) /* ret */ => void
+type Paren = (/* elem */ A)[]
+const cast = (/* expr */ value) as unknown
+function typed /* params */ <T>(x: T) /* ann */ : T {}
 export default class {}

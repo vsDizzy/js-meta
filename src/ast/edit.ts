@@ -18,7 +18,10 @@ class Drafts implements Session {
 
   draft(node: Node): Node {
     // Lists are copied too, so raw `draft.children[i].push(x)` can't touch the original.
-    const copy = make(node.type, attrsOf(node), node.children.map((s) => (Array.isArray(s) ? [...s] : s)))
+    const attrs = attrsOf(node)
+    // Leading comments are drafted with the node (they are few), for the same reason.
+    if (Array.isArray(attrs.comments)) attrs.comments = attrs.comments.map((c: Node) => (this.originals.has(c) ? c : this.draft(c)))
+    const copy = make(node.type, attrs, node.children.map((s) => (Array.isArray(s) ? [...s] : s)))
     const origin = originOf(node)
     if (origin) setOrigin(copy, origin)
     this.originals.set(copy, node)
@@ -58,6 +61,12 @@ class Drafts implements Session {
       return this.finish(toNode(s), done)
     }
     const children = node.children.map(slot)
+    // Leading comments: finished like children; none at all is no attr, as `read` gives.
+    if ('comments' in node) {
+      const list = node.comments
+      if (Array.isArray(list) && list.length) node.comments = list.map((c) => this.finish(toNode(c), done))
+      else delete node.comments
+    }
     const same = sameAttrs(node, original) && sameChildren(children, original.children)
     const result = same ? original : node
     if (!same) node.children = children
@@ -69,8 +78,12 @@ class Drafts implements Session {
 function sameAttrs(a: Node, b: Node) {
   const ka = Object.keys(a)
   if (ka.length !== Object.keys(b).length) return false
-  return ka.every((k) => k === 'children' || (k in b && Object.is(a[k], b[k])))
+  return ka.every((k) => k === 'children' || (k in b && (Object.is(a[k], b[k]) || (k === 'comments' && sameList(a[k], b[k])))))
 }
+
+/** Element by element, by identity (the draft's `comments` is a copy). */
+const sameList = (a: unknown, b: unknown) =>
+  Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((v, i) => v === b[i])
 
 function sameChildren(a: Slot[], b: Slot[]) {
   if (a.length !== b.length) return false

@@ -93,6 +93,21 @@ function toSlot(value: unknown): Slot {
 }
 
 /**
+ * `comments`, the leading comments of a node: an attribute that holds Comment
+ * nodes (never a slot). Converted like children; empty or absent is absent, so
+ * trees compare equal however they were built.
+ */
+function setComments(attrs: Record<string, unknown>, value: unknown) {
+  delete attrs.comments
+  if (value === null || value === undefined) return
+  const comments = Array.isArray(value) ? value.map((c) => toNode(c)) : []
+  if (!Array.isArray(value) || comments.some((c) => c.type !== 'Comment')) {
+    throw new TypeError(`comments: a list of Comment nodes, not ${JSON.stringify(value)}`)
+  }
+  if (comments.length) attrs.comments = comments
+}
+
+/**
  * A node from any of the three shapes: a Node (returned as is), our plain form
  * `{ type, ...attrs, children }`, or an ESTree object `{ type, left, right, ... }`.
  */
@@ -110,23 +125,27 @@ export function toNode(value: unknown): Node {
       if (children.length > slots.length) throw new TypeError(`${type}: ${children.length} children, ${slots.length} slots`)
       while (children.length < slots.length) children.push(null)
     }
-    return make(type, attrsOf(value), children)
+    const attrs = attrsOf(value)
+    setComments(attrs, value.comments)
+    return make(type, attrs, children)
   }
 
   const attrs: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(value)) {
-    if (k === 'type' || POSITION_KEYS.has(k) || slots?.includes(k)) continue
+    if (k === 'type' || k === 'comments' || POSITION_KEYS.has(k) || slots?.includes(k)) continue
     if (holdsNodes(v)) {
       throw new TypeError(slots ? `${type}.${k}: holds nodes but is not a slot` : `unknown node type "${type}" with child "${k}": use define() or { type, children }`)
     }
     attrs[k] = v
   }
+  setComments(attrs, value.comments)
   return make(type, attrs, (slots ?? []).map((s) => toSlot(value[s])))
 }
 
 /** Plain ESTree objects (named fields, no classes): for tools that speak ESTree. */
 export function toEstree(node: Node): Record<string, unknown> {
   const out: Record<string, unknown> = { type: node.type, ...attrsOf(node) }
+  if (Array.isArray(node.comments)) out.comments = node.comments.map((c) => toEstree(toNode(c)))
   const conv = (s: Slot): unknown => (Array.isArray(s) ? s.map(conv) : s === null ? null : toEstree(s))
   const slots = slotsOf(node.type)
   if (!slots) out.children = node.children.map(conv)

@@ -14,3 +14,4 @@ export function App({ items, ...props }) {
   )
 }
 const el = <a href={url}>link</a>
+const led = <p title={/* attr */ 'x'}>{/* lead */ value}</p>

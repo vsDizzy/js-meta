@@ -79,6 +79,16 @@ describe('emitWithMap', () => {
     assert.deepEqual([a.originalLine, a.originalColumn], [1, 8])
   })
 
+  test('leading comments map to themselves; their node keeps its place and name', () => {
+    const { code, origin } = consumer('x =\n  /* c */ y\nx = (/* d */ z).w')
+    assert.equal(code, 'x = /* c */ y\nx = (/* d */ z).w\n')
+    assert.match(origin('/* c */').text, /^\/\* c \*\/ y/)
+    assert.equal(origin('y').name, 'y')
+    assert.equal(origin('y').originalColumn, 10)
+    assert.equal(origin('z').name, 'z', 'in parens, the name is still at the identifier')
+    assert.match(origin('z').text, /^z\)/)
+  })
+
   test('nodes from another file add a source', () => {
     const lib = read('helper()', { filename: 'http://x/lib.js' })
     const ast = edit(read('main()', { filename: 'http://x/main.js' }), (d: any) => {

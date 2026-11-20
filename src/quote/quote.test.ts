@@ -65,6 +65,16 @@ describe('js: values by position', () => {
     assert.equal(print(js`if (a) ${js`b()`}`), 'if (a) b()')
   })
 
+  test('leading comments stay on their node; a hole passes its comments to the value', () => {
+    const pure = js`/* @__PURE__ */ f()`
+    assert.equal(pure.type, 'CallExpression')
+    assert.deepEqual((pure.comments as any[]).map((c) => c.value), [' @__PURE__ '])
+    assert.equal(print(js`const x = ${pure}`), 'const x = /* @__PURE__ */ f()')
+    assert.equal(print(js`const x = /* @__PURE__ */ ${js`g()`}`), 'const x = /* @__PURE__ */ g()')
+    assert.equal(print(js`if (/* why */ ${x}) y()`), 'if (/* why */ x) y()')
+    assert.deepEqual(emitWithMap(pure).map.sources, [], 'template comments have no origin either')
+  })
+
   test('mistakes are errors that name the hole', () => {
     assert.throws(() => js`f(${undefined})`, /\$\{\} #1 in js`f\(\$\{…\}\)` is undefined/)
     assert.throws(() => js`a + ${[x]}`, /is an array, but it stands where a single node goes/)
@@ -100,6 +110,12 @@ describe('match', () => {
     assert.equal(print(match(js`<a><b />text</a>`, js`<a>{$$kids}</a>`)!.kids), '<b />\ntext')
     assert.equal(print(match(js`<Box x={1} />`, js`<$C x={1} />`)!.C), 'Box')
     assert.equal(print(match(js`o.prop`, js`o.$p`)!.p), 'prop')
+  })
+
+  test('leading comments are ignored, on either side', () => {
+    assert.equal(print(match(read('x = /* @__PURE__ */ f(1)').body[0], js`x = f($a)`)!.a), '1')
+    assert.ok(match(js`f(1)`, js`/* any */ f($a)`))
+    assert.ok(match(read('if (/* c */ a) b()').body[0], js`if (a) $_`))
   })
 
   test('expression patterns match expression statements; declarations match expressions', () => {
@@ -147,6 +163,19 @@ describe('rule', () => {
     assert.equal(print(out), 'f(1)\ng()')
     const { map } = emitWithMap(out)
     assert.ok(map.mappings.includes(';'), 'the second line is mapped')
+  })
+
+  test('the leading comments of a form go to its expansion, once', () => {
+    assert.equal(print(walk(read('x = /* why */ add(1, 2)'), rule(js`add($a, $b)`, js`$a + $b`))), 'x = /* why */ 1 + 2')
+    const chain = rules(rule(js`inc($x)`, js`plus($x, 1)`), rule(js`plus($a, $b)`, js`$a + $b`))
+    assert.equal(print(walk(read('v = /* why */ inc(n)\nif (a) /* s */ inc(m)'), chain)), 'v = /* why */ n + 1\nif (a) /* s */ m + 1')
+    // A capture as the whole replacement is copied, not changed.
+    const ast = read('x = /* why */ id(y)\nz = [id(y), id(y)]')
+    const y = (ast.body[0] as any).expression.right.arguments[0]
+    assert.equal(print(walk(ast, rule(js`id($a)`, js`$a`))), 'x = /* why */ y\nz = [y, y]')
+    assert.ok(!('comments' in y))
+    // A template with its own leading comments keeps them.
+    assert.equal(print(walk(read('x = /* why */ f()'), rule(js`f()`, js`/* @__PURE__ */ g()`))), 'x = /* @__PURE__ */ g()')
   })
 
   test('mistakes: an uncaptured variable, a rule that never settles', () => {

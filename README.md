@@ -14,7 +14,7 @@ emit(out) // 'const total = price + (tax + 1)\n'
 
 ## Code as data
 
-- **`read(source, { filename })`** parses JS (and JSX) into nodes. Positions live in a side table (`originOf(node)`), and comments are nodes too.
+- **`read(source, { filename })`** parses JS (and JSX) into nodes. Positions live in a side table (`originOf(node)`), and comments are nodes too: siblings in lists, or the `comments` of the node they lead (`x = /* @__PURE__ */ f()`).
 - **`emit(ast)`** prints in one canonical style: no semicolons, ASI-safe. `read(emit(ast))` gives the same tree back. `emitWithMap(ast)` also returns a Source Map v3.
 - **Nodes** are `{ type, ...attrs, children }`, with named accessors (`node.left` is `children[0]` of a `BinaryExpression`). `JSON.stringify` gives the plain form, and `toEstree` / `toNode` convert to and from ESTree.
 - **Immutable values, JS-style edits.** Outside `edit()` nodes don't change. Inside, you assign as usual, and the copies share every untouched subtree:

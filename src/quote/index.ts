@@ -87,7 +87,22 @@ function parse(strings: TemplateStringsArray, mode: Mode): Template {
 
 /** A copy without origins: template nodes take the origin of what they replace. */
 function bare(node: Node): Node {
-  return make(node.type, attrsOf(node), node.children.map((s) => (Array.isArray(s) ? s.map((n) => n && bare(n)) : s && bare(s))))
+  const attrs = attrsOf(node)
+  if (Array.isArray(attrs.comments)) attrs.comments = attrs.comments.map(bare)
+  return make(node.type, attrs, node.children.map((s) => (Array.isArray(s) ? s.map((n) => n && bare(n)) : s && bare(s))))
+}
+
+const leadOf = (n: Node | null | undefined) => (n?.comments as Node[] | undefined) ?? []
+
+/** `node` with the leading comments of the hole it fills first: `/* @__PURE__ *\/ ${call}`. */
+function withLead(hole: Node, node: Node): Node {
+  // `{/* c */ ${kids}}`: the comment sits on the placeholder inside the wrapper.
+  const comments = [...leadOf(hole), ...(hole.type === 'JSXExpressionContainer' ? leadOf(hole.children[0] as Node) : [])]
+  if (!comments.length) return node
+  const out = make(node.type, { ...attrsOf(node), comments: [...comments, ...leadOf(node)] }, node.children)
+  const origin = originOf(node)
+  if (origin) setOrigin(out, origin)
+  return out
 }
 
 function checkStrings(tree: Node | Node[], prefix: string, shown: string) {
@@ -198,8 +213,9 @@ function fill(tree: Node | Node[], h: Holes): Node | Node[] {
           }
           changed = true
           const v = h.value(hole.key)
-          if (Array.isArray(v)) for (const item of v) out.push(put(hole, item))
-          else out.push(put(hole, v))
+          const items = (Array.isArray(v) ? v : [v]).map((item) => put(hole, item))
+          if (items.length) items[0] = withLead(el, items[0])
+          out.push(...items)
         }
         return out
       }
@@ -213,7 +229,7 @@ function fill(tree: Node | Node[], h: Holes): Node | Node[] {
       changed = true
       const v = h.value(hole.key)
       if (Array.isArray(v)) throw new TypeError(`${h.label(hole.key)} is an array, but it stands where a single node goes, in ${h.shown}`)
-      return put(hole, v)
+      return withLead(slot, put(hole, v))
     })
     if (!changed) return node
     const attrs = attrsOf(node)

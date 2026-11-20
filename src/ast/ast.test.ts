@@ -63,6 +63,27 @@ describe('node form', () => {
     assert.equal(emit(sum), 'a + 1')
   })
 
+  test('leading comments: `comments` is an attribute of Comment nodes, in every shape', () => {
+    const pure = () => b.Comment({ kind: 'Block', value: ' @__PURE__ ' })
+    const f = b.Identifier({ name: 'f', optional: false, decorators: [] })
+    const call = b.CallExpression({ callee: f, arguments: [], optional: false, comments: [pure()] })
+    assert.equal(emit(call), '/* @__PURE__ */ f()')
+    assert.deepEqual(call.children.length, 3, 'not a slot')
+    const read = (expr('x = /* @__PURE__ */ f()') as any).right
+    assert.deepEqual(call, read)
+    // Plain form, ESTree form and back.
+    const plain = JSON.parse(JSON.stringify(call))
+    assert.deepEqual(plain.comments, [{ type: 'Comment', kind: 'Block', value: ' @__PURE__ ', children: [] }])
+    assert.deepEqual(toNode(plain), call)
+    assert.ok((toNode(plain).comments as Node[])[0] instanceof Node)
+    assert.deepEqual(toEstree(call).comments, [{ type: 'Comment', kind: 'Block', value: ' @__PURE__ ' }])
+    assert.deepEqual(toNode(toEstree(call)), call)
+    // None is no attr at all, so trees built either way compare equal.
+    assert.ok(!('comments' in b.Identifier({ name: 'a', comments: [] })))
+    assert.ok(!('comments' in toNode({ type: 'Identifier', name: 'a', comments: null, children: [] })))
+    assert.throws(() => b.Identifier({ name: 'a', comments: [b.Identifier({ name: 'x' })] }), /comments: a list of Comment nodes/)
+  })
+
   test('define a new node type', () => {
     define('Unless', ['test', 'body'])
     const u = toNode({ type: 'Unless', test: { type: 'Identifier', name: 'x' }, body: { type: 'BlockStatement', body: [] } }) as any
@@ -148,6 +169,22 @@ describe('edit', () => {
     edit(js('a'), (d: any) => void (leaked = d.body[0]))
     assert.throws(() => (leaked.expression = null), /immutable/)
   })
+
+  test('leading comments: changed on the draft only; unchanged stays shared', () => {
+    const ast = js('x = /* a */ y')
+    const right = () => (ast.body[0] as any).expression.right
+    const next = edit(ast, (d: any) => {
+      const r = d.body[0].expression.right
+      r.comments.push(b.Comment({ kind: 'Block', value: ' b ' }))
+      r.comments[0].value = ' A '
+    })
+    assert.equal(emit(next), 'x = /* A */ /* b */ y\n')
+    assert.equal(emit(ast), 'x = /* a */ y\n', 'original untouched')
+    assert.equal(edit(ast, (d: any) => void d.body[0].expression.right.comments[0].value), ast)
+    const none = edit(ast, (d: any) => void (d.body[0].expression.right.comments = []))
+    assert.ok(!('comments' in (none.body[0] as any).expression.right), 'emptied: no attr')
+    assert.equal(right().comments.length, 1)
+  })
 })
 
 describe('walk', () => {
@@ -231,6 +268,62 @@ describe('walk', () => {
     const seen: string[] = []
     walk(js('f(a)'), { CallExpression: (_, ctx) => ctx.skip(), Identifier: (n: any) => void seen.push(n.name) })
     assert.deepEqual(seen, [])
+  })
+
+  test('leading comments: visited after the owner enters, before its children', () => {
+    const seen: string[] = []
+    walk(js('x = /* a */ /* b */ f(y)'), (n) => void seen.push((n as any).name ?? (n.type === 'Comment' ? `/*${n.value}*/` : n.type)))
+    assert.deepEqual(seen, ['Program', 'ExpressionStatement', 'AssignmentExpression', 'x', 'CallExpression', '/* a */', '/* b */', 'f', 'y'])
+    const ctxs: Ctx[] = []
+    walk(js('x = /* a */ /* b */ f(y)'), { Comment: (_, ctx) => void ctxs.push(ctx) })
+    const [a, bb] = ctxs
+    assert.equal(a.parent?.type, 'CallExpression')
+    assert.equal(a.key, 'comments')
+    assert.deepEqual([a.index, bb.index], [0, 1])
+    assert.equal(a.prev, null)
+    assert.equal((a.next as any).value, ' b ')
+    assert.equal((bb.prev as any).value, ' a ')
+    assert.deepEqual(names(bb.ancestors), ['Program', 'ExpressionStatement', 'AssignmentExpression', 'CallExpression'])
+  })
+
+  test('leading comments: replace, remove, and sharing', () => {
+    const ast = js('x = /* a */ /* b */ f(y)\ng()')
+    const text = (n: Node) => emit(n!)
+    const upper = walk(ast, { Comment: (n: any) => (n.value === ' a ' ? b.Comment({ kind: 'Block', value: ' A ' }) : undefined) }) as any
+    assert.equal(text(upper), 'x = /* A */ /* b */ f(y)\ng()\n')
+    assert.equal(upper.body[1], ast.body[1], 'untouched statement shared')
+    assert.equal(text(walk(ast, { Comment: (n: any) => (n.value === ' a ' ? null : undefined) })!), 'x = /* b */ f(y)\ng()\n')
+    const none = walk(ast, { Comment: () => null }) as any
+    assert.ok(!('comments' in (none.body[0] as any).expression.right), 'emptied: no attr')
+    assert.equal(text(none), 'x = f(y)\ng()\n')
+    assert.equal(walk(ast, () => {}), ast, 'nothing changed: the same tree')
+  })
+
+  test('a replacement keeps the leading comments of the node it replaces, on a copy', () => {
+    const ast = js('x = /* why */ f(y)', 'http://x/m.js')
+    const call = (ast.body[0] as any).expression.right
+    const right = (n: Node | null) => (n as any).body[0].expression.right
+    // enter and leave; a shared node is copied, not changed, and the copy gets the origin
+    const z = b.Identifier({ name: 'z' })
+    for (const out of [walk(ast, { CallExpression: () => z }), walk(ast, { CallExpression: { leave: () => z } })]) {
+      assert.equal(emit(out!), 'x = /* why */ z\n')
+      assert.notEqual(right(out), z)
+      assert.deepEqual(originOf(right(out)), originOf(call))
+    }
+    assert.ok(!('comments' in z) && !originOf(z), 'the returned node is untouched')
+    // a replacement from the tree keeps its own origin
+    const y = walk(ast, { CallExpression: (n: any) => n.arguments[0] })
+    assert.equal(emit(y!), 'x = /* why */ y\n')
+    assert.deepEqual(originOf(right(y)), originOf(call.arguments[0]))
+    assert.ok(!('comments' in call.arguments[0]))
+    // its own comments win; a wrapper keeps them where they are, once
+    const own = b.Identifier({ name: 'z', comments: [b.Comment({ kind: 'Block', value: ' own ' })] })
+    assert.equal(emit(walk(ast, { CallExpression: () => own })!), 'x = /* own */ z\n')
+    const wrapped = walk(ast, { CallExpression: { leave: (n) => b.AwaitExpression({ argument: n }) } })!
+    assert.equal(emit(wrapped), 'x = await /* why */ f(y)\n')
+    // null removes the node and its comments
+    const list = b.ArrayExpression({ elements: [b.Identifier({ name: 'a', comments: [b.Comment({ kind: 'Block', value: ' a ' })] }), b.Identifier({ name: 'b' })] })
+    assert.equal(emit(walk(list, { Identifier: (n: any) => (n.name === 'a' ? null : undefined) })!), '[b]')
   })
 
   test('walks bare plain-form objects', () => {

@@ -109,6 +109,32 @@ describe('runtime', () => {
       assert.equal(ns.count, 10)
     })
 
+    test('comments are not part of a form: changing, adding or removing one runs nothing', async () => {
+      const src = 'export let count = /* start */ 0\nexport function inc() {\n  // step\n  count++\n}'
+      const { rt } = app({ 'c.js': src })
+      const ns = await rt.import('./c.js')
+      ;(ns.inc as () => void)()
+      const url = 'http://app/c.js'
+      const edits = [
+        src.replace('start', 'begin'), // a leading comment in an initializer: changed
+        src.replace('/* start */ ', ''), // removed
+        src.replace('/* start */', '/* a */ /* b */'), // added
+        src.replace('// step', '// one step'), // a comment in a function body: changed
+        src.replace('  // step\n', ''), // removed
+        src.replace('count++', '/* up */ count++\n  // done'), // added
+        `// top\n${src}`, // a top-level comment
+      ]
+      for (const next of edits) assert.equal((await rt.redefine(url, next)).changed, 0, next)
+      assert.equal(ns.count, 1, 'the initializer did not re-run')
+      assert.equal(rt.records.get(url)!.source, edits.at(-1), 'the record has the new source')
+      // A real change still runs, comments and all.
+      assert.equal((await rt.redefine(url, src.replace('count++', 'count += 10'))).changed, 1)
+      ;(ns.inc as () => void)()
+      assert.equal(ns.count, 11)
+      assert.equal((await rt.redefine(url, src.replace('/* start */ 0', '/* start */ 5'))).changed, 2)
+      assert.equal(ns.count, 5)
+    })
+
     test('removed bindings and exports go away', async () => {
       const { rt } = app(files())
       const ns = await rt.import('./counter.js')

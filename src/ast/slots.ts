@@ -1,6 +1,7 @@
 // Slot table: for each node type, the names of its child slots in source order.
 // `node.children[i]` holds slot `SLOTS[type][i]`: a node, `null`, or a list.
-// Everything else on a node is an attribute (scalars: operator, name, raw, ...).
+// Everything else on a node is an attribute (scalars: operator, name, raw, ...),
+// except `comments`: the node's leading Comment nodes, kept out of the slots.
 //
 // Seeded from @typescript-eslint/visitor-keys 8.72.2, owned here from now on:
 // adding a node type means adding its slots. Names are ESTree's, except that a

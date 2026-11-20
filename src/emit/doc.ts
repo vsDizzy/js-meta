@@ -4,10 +4,12 @@
 //   hardline        line break; the next line gets the current indentation
 //   indent(doc)     one level deeper for the line breaks inside
 //   mark(node, doc) `doc` is the text of `node` (for source maps)
+//   aside(doc)      rendered as usual, but not code: `head`/`text` skip it
+//                   (leading comments, so `/* c */ {}` still starts with `{`)
 // Indentation is written lazily, so blank lines carry no trailing spaces.
 // No wrapping yet: `group`/`line` (Wadler) can be added without touching printers.
 
-export type Doc = string | readonly Doc[] | Hardline | Indent | Mark
+export type Doc = string | readonly Doc[] | Hardline | Indent | Mark | Aside
 interface Hardline {
   readonly kind: 'hardline'
 }
@@ -20,10 +22,15 @@ interface Mark {
   readonly node: object
   readonly doc: Doc
 }
+interface Aside {
+  readonly kind: 'aside'
+  readonly doc: Doc
+}
 
 export const hardline: Hardline = { kind: 'hardline' }
 export const indent = (doc: Doc): Indent => ({ kind: 'indent', doc })
 export const mark = (node: object, doc: Doc): Mark => ({ kind: 'mark', node, doc })
+export const aside = (doc: Doc): Aside => ({ kind: 'aside', doc })
 
 /** `docs` with `sep` between them. */
 export function join(sep: Doc, docs: readonly Doc[]): Doc[] {
@@ -79,7 +86,7 @@ export function render(doc: Doc, sink?: Sink): string {
       for (const x of d as readonly Doc[]) go(x)
       return
     }
-    const node = d as Hardline | Indent | Mark
+    const node = d as Hardline | Indent | Mark | Aside
     switch (node.kind) {
       case 'hardline':
         out.push('\n')
@@ -92,6 +99,8 @@ export function render(doc: Doc, sink?: Sink): string {
         go(node.doc)
         depth--
         return
+      case 'aside':
+        return go(node.doc)
       case 'mark': {
         const before = pending
         const written = out.length
@@ -110,7 +119,7 @@ export function render(doc: Doc, sink?: Sink): string {
   return out.join('')
 }
 
-/** The first `n` characters of the text of `doc` (a line break counts as "\n"). */
+/** The first `n` characters of the text of `doc` (a line break counts as "\n"), asides left out. */
 export function head(doc: Doc, n: number): string {
   let s = ''
   const go = (d: Doc): boolean => {
@@ -118,9 +127,9 @@ export function head(doc: Doc, n: number): string {
     else if (Array.isArray(d)) {
       for (const x of d as readonly Doc[]) if (go(x)) return true
     } else {
-      const node = d as Hardline | Indent | Mark
+      const node = d as Hardline | Indent | Mark | Aside
       if (node.kind === 'hardline') s += '\n'
-      else if (go(node.doc)) return true
+      else if (node.kind !== 'aside' && go(node.doc)) return true
     }
     return s.length >= n
   }
@@ -128,5 +137,5 @@ export function head(doc: Doc, n: number): string {
   return s.slice(0, n)
 }
 
-/** All the text of `doc` on one level (for short docs: names, numbers). */
+/** All the text of `doc` on one level (for short docs: names, numbers), asides left out. */
 export const text = (doc: Doc) => head(doc, Infinity)

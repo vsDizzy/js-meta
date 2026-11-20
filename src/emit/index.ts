@@ -1,11 +1,12 @@
 // emit(ast) -> JavaScript source. One canonical style, no options:
 //   2-space indent, no semicolons (ASI-safe), no line wrapping,
 //   literals from `raw` when present, parentheses from precedence,
-//   comments as nodes: own line in statement lists, inline in expression lists.
+//   comments as nodes: own line in statement lists, inline in expression lists,
+//   and a node's leading comments (`comments`) right before it: `f(/* c */ a)`.
 // Printers are plain functions `node -> Doc` (doc.ts), one per node type
 // (PRINTERS); the renderer turns the Doc into text and, if asked, a source map.
 import { toNode, type Node } from '../ast/node.ts'
-import { hardline, head, indent, join, mark, render, text, type Doc } from './doc.ts'
+import { aside, hardline, head, indent, join, mark, render, text, type Doc } from './doc.ts'
 import { MapBuilder, type SourceMap } from './sourcemap.ts'
 
 export type { Doc } from './doc.ts'
@@ -43,14 +44,63 @@ export function emitWithMap(input: Node | object): { code: string; map: SourceMa
   return { code, map: map.toJSON() }
 }
 
-/** Nodes to wrap in parens once, whatever their position (see `wrapLeftmost`). */
+/** Nodes to wrap in parens once, whatever their position (see `wrapLeftmost`, `startChild`). */
 const wrapOnce = new WeakSet<object>()
 
-function print(node: N, ctx: Ctx): Doc {
+/** Prints a node with its leading comments; `leading: false` leaves them to the caller. */
+function print(node: N, ctx: Ctx, leading = true): Doc {
   const printer = PRINTERS[node.type]
   if (!printer) throw new Error(`emit: unknown node type "${node.type}"`)
-  if (wrapOnce.delete(node)) return mark(node, ['(', printer(node, PLAIN), ')'])
-  return mark(node, printer(node, ctx))
+  const first = startChild(node)
+  if (first && hasLead(first)) wrapOnce.add(first)
+  const comments = leading ? lead(node) : ''
+  // Comments inside the parens (before them they would lead the parent); the
+  // mark starts at the node itself, so a name maps where it is written.
+  if (wrapOnce.delete(node)) return ['(', comments, mark(node, printer(node, PLAIN)), ')']
+  return [comments, mark(node, printer(node, ctx))]
+}
+
+/**
+ * The child whose text starts the text of `n`, with no keyword or bracket before
+ * it. A leading comment printed there would be read back as the comment of `n`
+ * (or of the statement), so such a child is wrapped once: `(/* c *\/ a) + b`.
+ * Like `leftmost`, one step at a time; patterns can't be wrapped.
+ */
+function startChild(n: N): N | undefined {
+  switch (n.type) {
+    case 'ExpressionStatement':
+      return n.directive === undefined ? n.expression : undefined
+    case 'CallExpression':
+      return n.callee
+    case 'MemberExpression':
+      return n.object
+    case 'TaggedTemplateExpression':
+      return n.tag
+    case 'BinaryExpression':
+    case 'LogicalExpression':
+      return n.left
+    case 'AssignmentExpression':
+      return /Pattern$/.test(n.left.type) ? undefined : n.left
+    case 'ConditionalExpression':
+      return n.test
+    case 'UpdateExpression':
+      return n.prefix ? undefined : n.argument
+    case 'TSAsExpression':
+    case 'TSSatisfiesExpression':
+    case 'TSNonNullExpression':
+    case 'TSInstantiationExpression':
+      return n.expression
+    case 'TSArrayType':
+      return n.elementType
+    case 'TSIndexedAccessType':
+      return n.objectType
+    case 'TSConditionalType':
+      return n.checkType
+    case 'TSOptionalType':
+      return n.typeAnnotation
+    default:
+      return undefined
+  }
 }
 
 /** The node whose text starts the text of `n` (ignoring parens). */
@@ -157,7 +207,11 @@ function prec(n: N): number {
   }
 }
 
-const parens = (node: N): Doc => ['(', print(node, PLAIN), ')']
+/** `(node)`; these parens also serve a pending wrap (`wrapOnce`). */
+function parens(node: N): Doc {
+  wrapOnce.delete(node)
+  return ['(', print(node, PLAIN), ')']
+}
 
 /** `node` as an operand that must bind at least as tight as `min`. */
 function expr(node: N, ctx: Ctx, min = P.SEQ): Doc {
@@ -189,6 +243,33 @@ function hasCall(n: N): boolean {
 const commentText = (c: N) => (c.kind === 'Line' ? `//${c.value}` : `/*${c.value}*/`)
 const comment = (c: N): Doc => mark(c, commentText(c))
 const isComment = (n: N) => n !== null && n.type === 'Comment'
+
+const hasLead = (n: N): boolean => !!n?.comments?.length
+
+/**
+ * `/* c *\/ ` before a node: its leading comments, inline. Not code to `head`, so
+ * checks like "starts with `{`" see through them. Only block comments: a line
+ * comment would swallow the rest of the line.
+ */
+function lead(n: N): Doc {
+  if (!hasLead(n)) return ''
+  return aside(
+    (n.comments as N[]).map((c) => {
+      if (c.kind !== 'Block') throw new Error(`emit: a ${c.kind} comment can't lead ${n.type} (it would end the line), only a Block comment`)
+      return [comment(c), ' ']
+    }),
+  )
+}
+
+/** ` /* c *\/ ` where the node follows text with no space (`f /* c *\/ <T>()`, `x /* c *\/ : T`). */
+const leadAfter = (n: N): Doc => (hasLead(n) ? [' ', lead(n)] : '')
+/** A space before a child that `print` gives leading comments: `< /* c *\/ a>`, not `</* c *\/ a>`. */
+const spaceBefore = (n: N): Doc => (hasLead(n) ? ' ' : '')
+
+/** After `return`/`throw`/`yield` a line break ends the statement: a multi-line comment goes in parens. */
+const LINE_BREAK = new RegExp(`[\\n\\r${String.fromCharCode(0x2028, 0x2029)}]`)
+const breaksLine = (n: N): boolean => !!n?.comments?.some((c: N) => LINE_BREAK.test(c.value))
+const restricted = (n: N, ctx: Ctx, min = P.SEQ): Doc => (breaksLine(n) ? parens(n) : expr(n, ctx, min))
 
 interface ListOptions {
   open: string
@@ -357,11 +438,17 @@ function literal(n: N): string {
 // ---------------------------------------------------------------------------
 // Pieces shared by several node types
 
-/** `: T` */
-const ann = (n: N): Doc => (n ? [': ', type(n.typeAnnotation)] : '')
+// The helpers below print a child's parts in place of `print(child)`, so they
+// print its leading comments themselves.
 
-const typeParams = (n: N, ctx: Ctx): Doc => (n ? list(n.params, ctx, nodeItem, { open: '<', close: '>' }) : '')
-const typeArgs = (n: N, ctx: Ctx): Doc => (n ? list(n.params, ctx, typeItem, { open: '<', close: '>' }) : '')
+/** `: T` */
+const ann = (n: N): Doc => (n ? [leadAfter(n), ': ', type(n.typeAnnotation)] : '')
+
+const typeParams = (n: N, ctx: Ctx): Doc => (n ? [leadAfter(n), list(n.params, ctx, nodeItem, { open: '<', close: '>' })] : '')
+const typeArgs = (n: N, ctx: Ctx): Doc => (n ? [leadAfter(n), list(n.params, ctx, typeItem, { open: '<', close: '>' })] : '')
+
+/** A function's block body, `{ ... }`. */
+const fnBody = (n: N): Doc => [lead(n), block(n.body)]
 
 function decorators(items: N[] | undefined, ctx: Ctx): Doc {
   if (!items?.length) return ''
@@ -392,10 +479,12 @@ function method(n: N, ctx: Ctx, prefix: string): Doc {
   return [
     decorators(n.decorators, ctx),
     words,
+    f.generator ? spaceBefore(n.key) : '',
     key(n, ctx),
     n.optional ? '?' : '',
+    leadAfter(f),
     signature(f, ctx),
-    f.body ? [' ', block(f.body.body)] : '',
+    f.body ? [' ', fnBody(f.body)] : '',
   ]
 }
 
@@ -405,8 +494,10 @@ const signature = (f: N, ctx: Ctx): Doc => [typeParams(f.typeParameters, ctx), p
 function fn(n: N, ctx: Ctx): Doc {
   let s = n.declare ? 'declare ' : ''
   if (n.async) s += 'async '
-  s += 'function' + (n.generator ? '*' : '') + ' '
-  return [s, n.id ? print(n.id, ctx) : '', signature(n, ctx), n.body ? [' ', block(n.body.body)] : '']
+  s += 'function' + (n.generator ? '*' : '')
+  // `function /* c */ <T>()`: the comment of the type parameters brings its own space.
+  if (n.id || !hasLead(n.typeParameters)) s += ' '
+  return [s, n.id ? print(n.id, ctx) : '', signature(n, ctx), n.body ? [' ', fnBody(n.body)] : '']
 }
 
 function cls(n: N, ctx: Ctx): Doc {
@@ -464,8 +555,7 @@ function typePrec(n: N): number {
 }
 
 function type(n: N, min = T.FUNCTION): Doc {
-  const s = print(n, PLAIN)
-  return typePrec(n) < min ? ['(', s, ')'] : s
+  return typePrec(n) < min ? parens(n) : print(n, PLAIN)
 }
 
 const typeItem = (n: N): Doc => type(n)
@@ -514,8 +604,8 @@ const PRINTERS: Record<string, Printer> = {
   StaticBlock: (n) => ['static ', block(n.body)],
   EmptyStatement: () => ';',
   DebuggerStatement: () => 'debugger',
-  ReturnStatement: (n, ctx) => ['return', n.argument ? [' ', expr(n.argument, ctx)] : ''],
-  ThrowStatement: (n, ctx) => ['throw ', expr(n.argument, ctx)],
+  ReturnStatement: (n, ctx) => ['return', n.argument ? [' ', restricted(n.argument, ctx)] : ''],
+  ThrowStatement: (n, ctx) => ['throw ', restricted(n.argument, ctx)],
   BreakStatement: (n, ctx) => ['break', n.label ? [' ', print(n.label, ctx)] : ''],
   ContinueStatement: (n, ctx) => ['continue', n.label ? [' ', print(n.label, ctx)] : ''],
   LabeledStatement: (n, ctx) => [print(n.label, ctx), ':', body(n.body)],
@@ -610,7 +700,7 @@ const PRINTERS: Record<string, Printer> = {
     const kind = n.importKind === 'type' ? 'type ' : ''
     const imported = print(n.imported, ctx)
     const local = print(n.local, ctx)
-    return [kind, text(imported) === text(local) ? local : [imported, ' as ', local]]
+    return [kind, sameName(n.imported, imported, n.local, local) ? local : [imported, ' as ', local]]
   },
   ImportAttribute: (n, ctx) => [print(n.key, ctx), ': ', print(n.value, ctx)],
   ExportNamedDeclaration(n, ctx) {
@@ -623,7 +713,7 @@ const PRINTERS: Record<string, Printer> = {
     const kind = n.exportKind === 'type' ? 'type ' : ''
     const local = print(n.local, ctx)
     const exported = print(n.exported, ctx)
-    return [kind, text(local) === text(exported) ? local : [local, ' as ', exported]]
+    return [kind, sameName(n.local, local, n.exported, exported) ? local : [local, ' as ', exported]]
   },
   ExportDefaultDeclaration(n, ctx) {
     const d = n.declaration
@@ -648,7 +738,8 @@ const PRINTERS: Record<string, Printer> = {
   MetaProperty: (n, ctx) => [print(n.meta, ctx), '.', print(n.property, ctx)],
   TemplateLiteral: (n) => template(n.quasis, n.expressions, (e) => expr(e, PLAIN)),
   TemplateElement: (n) => n.value.raw,
-  TaggedTemplateExpression: (n, ctx) => [lhs(n.tag, ctx), typeArgs(n.typeArguments, ctx), print(n.quasi, ctx)],
+  TaggedTemplateExpression: (n, ctx) =>
+    [lhs(n.tag, ctx), typeArgs(n.typeArguments, ctx), spaceBefore(n.quasi), print(n.quasi, ctx)],
   ArrayExpression: (n, ctx) => list(n.elements, ctx, exprItem, { open: '[', close: ']' }),
   ArrayPattern: (n, ctx) => binding(n, ctx, list(n.elements, ctx, nodeItem, { open: '[', close: ']' })),
   ObjectExpression: (n, ctx) => list(n.properties, ctx, nodeItem, { open: '{', close: '}', pad: true }),
@@ -666,10 +757,10 @@ const PRINTERS: Record<string, Printer> = {
     // `<T,>`: a bare `<T>` would start JSX in .tsx files.
     const tp = n.typeParameters
     if (tp?.params.length === 1 && !tp.params[0].constraint && !isComment(tp.params[0])) {
-      out.push(mark(tp, ['<', print(tp.params[0], ctx), ',>']))
-    } else out.push(typeParams(tp, ctx))
+      out.push(lead(tp), mark(tp, ['<', print(tp.params[0], ctx), ',>']))
+    } else if (tp) out.push(lead(tp), list(tp.params, ctx, nodeItem, { open: '<', close: '>' }))
     out.push(params(n.params, ctx), ann(n.returnType), ' => ')
-    if (n.body.type === 'BlockStatement') return [out, mark(n.body, block(n.body.body))]
+    if (n.body.type === 'BlockStatement') return [out, lead(n.body), mark(n.body, block(n.body.body))]
     wrapLeftmost(n.body, /^ObjectExpression$/)
     const b = expr(n.body, ctx, P.ASSIGN)
     return [out, head(b, 1) === '{' ? ['(', b, ')'] : b]
@@ -699,7 +790,7 @@ const PRINTERS: Record<string, Printer> = {
   },
   AwaitExpression: (n, ctx) => ['await ', expr(n.argument, ctx, P.UNARY)],
   YieldExpression: (n, ctx) =>
-    ['yield', n.delegate ? '*' : '', n.argument ? [' ', expr(n.argument, ctx, P.ASSIGN)] : ''],
+    ['yield', n.delegate ? '*' : '', n.argument ? [' ', restricted(n.argument, ctx, P.ASSIGN)] : ''],
   CallExpression: (n, ctx) =>
     [lhs(n.callee, ctx), n.optional ? '?.' : '', typeArgs(n.typeArguments, ctx), args(n.arguments, ctx)],
   NewExpression(n, ctx) {
@@ -726,9 +817,9 @@ const PRINTERS: Record<string, Printer> = {
     const multiline = first === '\n'
     const sp = multiline || !first ? attrs : [' ', attrs]
     const end = n.selfClosing ? (multiline ? '/>' : ' />') : '>'
-    return ['<', print(n.name, ctx), typeArgs(n.typeArguments, ctx), sp, end]
+    return ['<', spaceBefore(n.name), print(n.name, ctx), typeArgs(n.typeArguments, ctx), sp, end]
   },
-  JSXClosingElement: (n, ctx) => ['</', print(n.name, ctx), '>'],
+  JSXClosingElement: (n, ctx) => ['</', spaceBefore(n.name), print(n.name, ctx), '>'],
   JSXAttribute: (n, ctx) => [print(n.name, ctx), n.value ? ['=', print(n.value, ctx)] : ''],
   JSXSpreadAttribute: (n) => ['{...', expr(n.argument, PLAIN, P.ASSIGN), '}'],
   JSXSpreadChild: (n) => ['{...', expr(n.expression, PLAIN, P.ASSIGN), '}'],
@@ -815,9 +906,9 @@ const PRINTERS: Record<string, Printer> = {
     ' : ',
     type(n.falseType),
   ],
-  TSFunctionType: (n, ctx) => [signatureNoReturn(n, ctx), ' => ', returnType(n.returnType)],
+  TSFunctionType: (n, ctx) => [signatureNoReturn(n, ctx), arrowReturn(n.returnType)],
   TSConstructorType: (n, ctx) =>
-    [n.abstract ? 'abstract ' : '', 'new ', signatureNoReturn(n, ctx), ' => ', returnType(n.returnType)],
+    [n.abstract ? 'abstract ' : '', 'new ', signatureNoReturn(n, ctx), arrowReturn(n.returnType)],
   TSTypeLiteral: (n, ctx) => typeMembers(n.members, ctx),
   TSPropertySignature: (n, ctx) =>
     [n.readonly ? 'readonly ' : '', key(n, ctx), n.optional ? '?' : '', ann(n.typeAnnotation)],
@@ -857,7 +948,7 @@ const PRINTERS: Record<string, Printer> = {
   ],
   TSTypePredicate(n, ctx) {
     const s: Doc = [n.asserts ? 'asserts ' : '', print(n.parameterName, ctx)]
-    return n.typeAnnotation ? [s, ' is ', returnType(n.typeAnnotation)] : s
+    return n.typeAnnotation ? [s, ' is ', lead(n.typeAnnotation), returnType(n.typeAnnotation)] : s
   },
 }
 
@@ -865,6 +956,12 @@ for (const [name, word] of Object.entries(KEYWORDS)) PRINTERS[name] = () => word
 
 /** A TSTypeAnnotation printed without `: ` (after `=>`, `is`); marked as itself. */
 const returnType = (n: N): Doc => mark(n, type(n.typeAnnotation))
+
+/** ` => R` of a function type; the annotation starts at `=>`, so its comments go before it. */
+const arrowReturn = (n: N): Doc => [hasLead(n) ? [' ', lead(n), '=> '] : ' => ', returnType(n)]
+
+/** `a as a` is just `a`, unless a comment sits on one of them. */
+const sameName = (a: N, ad: Doc, b: N, bd: Doc) => !hasLead(a) && !hasLead(b) && text(ad) === text(bd)
 
 function property(n: N, ctx: Ctx): Doc {
   const accessor = n.type === 'AccessorProperty' || n.type === 'TSAbstractAccessorProperty' ? 'accessor ' : ''
@@ -927,10 +1024,11 @@ function hasComputed(n: N): boolean {
   return false
 }
 
-/** JSX children are printed verbatim; a comment child becomes `{/* c *\/}`. */
+/** JSX children are printed verbatim; a comment child becomes `{/* c *\/}`, so do leading comments. */
 function jsxChildren(children: N[], ctx: Ctx): Doc {
+  const commentChild = (c: N): Doc => (c.kind === 'Line' ? ['{', comment(c), hardline, '}'] : ['{', comment(c), '}'])
   return children.map((c) => {
-    if (!isComment(c)) return print(c, ctx)
-    return c.kind === 'Line' ? ['{', comment(c), hardline, '}'] : ['{', comment(c), '}']
+    if (isComment(c)) return commentChild(c)
+    return [(c.comments ?? []).map(commentChild), print(c, ctx, false)]
   })
 }

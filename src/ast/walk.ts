@@ -1,11 +1,18 @@
 // walk(ast, visitor) -> new root. Visits every node in source order, comments
-// included. Returning from a handler transforms the tree:
+// included: a node's leading comments (its `comments` attribute) come right
+// after its `enter`, before its children, with `key: 'comments'`. Returning from
+// a handler transforms the tree:
 //   a node   -> replaces the current one
 //   null     -> removes it (from a list; a single slot becomes null)
 //   nothing  -> keeps it
 // A replacement from `enter` is walked into (prewalk: its children are visited,
 // it is not entered again); one from `leave` is final (postwalk). Unchanged
 // subtrees are shared: if nothing changed, the result is `===` the input.
+// A replacement keeps what the replaced node had and it lacks: the origin (a
+// macro expansion maps to its call site) and the leading comments (`x = /* why */
+// add(1, 2)` -> `x = /* why */ 1 + 2`). The comments go on a copy, so a shared
+// node (a capture put in two places) never changes; not if the replacement
+// already holds them (it wraps the replaced node), and not on removal.
 import { originOf, setOrigin } from './origin.ts'
 import { ALIASES, accessor } from './slots.ts'
 import { Node, slotsOf, toNode, withChildren, type Slot } from './node.ts'
@@ -13,7 +20,10 @@ import { Node, slotsOf, toNode, withChildren, type Slot } from './node.ts'
 export interface Ctx {
   /** Parent node in this walk; null at the root. */
   readonly parent: Node | null
-  /** Slot name in the parent (`'left'`, `'body'`); a number for types without a slot table. */
+  /**
+   * Slot name in the parent (`'left'`, `'body'`); a number for types without a
+   * slot table; `'comments'` for a leading comment of the parent.
+   */
   readonly key: string | number | null
   /** Position in the list, if the node sits in a list. */
   readonly index: number | null
@@ -67,16 +77,32 @@ function compile(visitor: Visitor): (type: string) => Handlers {
 
 /**
  * A handler's answer: undefined keeps the node. A replacement without an origin
- * takes the origin of the node it replaces (a macro expansion maps to its call).
+ * takes the origin of the node it replaces; one without a `comments` attribute
+ * takes its leading comments, on a copy (the returned node may be shared).
  */
 function answer(r: Result, replaced: Node): Node | null | undefined {
   if (r === undefined || r === null) return r as undefined | null
-  const node = toNode(r)
-  if (node !== replaced && !originOf(node)) {
+  let node = toNode(r)
+  if (node === replaced) return node
+  const comments = replaced.comments
+  if (Array.isArray(comments) && comments.length && node.comments === undefined && !holds(node, comments)) {
+    node = withChildren(node, node.children) // keeps the origin, if any
+    node.comments = comments
+  }
+  if (!originOf(node)) {
     const origin = originOf(replaced)
     if (origin) setOrigin(node, origin)
   }
   return node
+}
+
+/** `node` or a node inside it already has one of `comments`: it wraps the replaced node. */
+function holds(node: Node, comments: Node[]): boolean {
+  if (comments.includes(node)) return true
+  if (Array.isArray(node.comments) && node.comments.some((c) => comments.includes(c))) return true
+  return node.children.some((slot) =>
+    Array.isArray(slot) ? slot.some((el) => el !== null && holds(el, comments)) : slot !== null && slot !== undefined && holds(slot, comments),
+  )
 }
 
 /** Ancestors as a linked chain: shared by siblings, valid after the walk too. */
@@ -125,10 +151,25 @@ export function walk(root: Node, visitor: Visitor): Node | null {
     return node
   }
 
+  /** The leading comments of `node`, walked; the same array if none changed. */
+  function visitComments(node: Node, here: Chain): Node[] | undefined {
+    const list = node.comments
+    if (!Array.isArray(list) || !list.length) return undefined
+    let changed = false
+    const out: Node[] = []
+    list.forEach((c: Node, j) => {
+      const v = visit(c, here, 'comments', j, list)
+      if (v !== c) changed = true
+      if (v !== null) out.push(v)
+    })
+    return changed ? out : list
+  }
+
   function visitChildren(node: Node, up: Chain | null): Node {
     const slots = slotsOf(node.type)
     const here: Chain = { node, up }
-    let changed = false
+    const comments = visitComments(node, here)
+    let changed = comments !== undefined && comments !== node.comments
     const children = node.children.map((slot, i) => {
       const key = slots ? accessor(slots[i]) : i
       if (slot === null || slot === undefined) return null
@@ -146,7 +187,12 @@ export function walk(root: Node, visitor: Visitor): Node | null {
       })
       return out
     })
-    return changed ? withChildren(node, children) : node
+    if (!changed) return node
+    const out = withChildren(node, children)
+    // Emptied: no attr at all, as `read` would give.
+    if (comments?.length) out.comments = comments
+    else delete out.comments
+    return out
   }
 
   return visit(toNode(root), null, null, null, null)

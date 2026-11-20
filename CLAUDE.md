@@ -9,7 +9,10 @@ A homoiconic runtime for JavaScript: code is data the program can read, change a
 - **read** (`src/read/`, done): `read(source, { sourceType, filename })` returns an AST.
   - The parser sits behind an adapter (`Parser`). Today it is `@typescript-eslint/typescript-estree`; it can be swapped for another JS parser.
   - The output is ESTree (JS, JSX, TS types) as plain objects with no `range`/`loc`/`parent`. Positions live in a side table: `originOf(node)`.
-  - Comments are nodes (`{type:'Comment', kind, value}`) placed in the nearest list, right before their owner. There is one canonical rule and no layout flags.
+  - Comments are nodes (`{type:'Comment', kind, value}`) with one canonical place each and no layout flags (`src/read/comments.ts`):
+    - Among list elements: in the nearest list, right before their owner.
+    - A block comment in no list (`if (/* c */ a == 0)`, `x = /* @__PURE__ */ f()`) stays in place as a leading comment of the node after it: the outermost node that starts there, in its `comments` attribute (an array of Comment nodes; an attribute, not a slot, so `children` keep the shape "node, null or list").
+    - A line comment in no list, or a comment with no node after it, is hoisted before the enclosing list element.
   - `filename` is a module URL.
 - **emit** (`src/emit/`, done): `emit(ast)` returns code in one canonical style: no semicolons (ASI-safe), no line wrapping, literals printed from `raw`. It is round-trip stable: `read(emit(ast))` deep-equals `ast`, and `emit` reaches a fixed point after one pass.
   - Printers return a Doc IR (`src/emit/doc.ts`): strings, arrays, `hardline`, `indent`, `mark(node, doc)`. It is plain data that one renderer lays out, Wadler/Prettier-style. Nothing wraps lines yet; `group`/`line` can be added later without touching printers. Decide formatting from the AST, not by inspecting printed text (`head(doc, n)` only where unavoidable).
@@ -24,7 +27,8 @@ A homoiconic runtime for JavaScript: code is data the program can read, change a
   - `scope(ast)` (`src/ast/scope.ts`): a snapshot analysis of one tree. It gives `bindingOf(id)` (Binding | null for free), `scopeOf(node)`, `root.bindings`, `free`, `names`, plus `freshName(base, names)` for hygiene. Import bindings carry `{ source, name }`. TS type positions are skipped (not values). JSX components (`<Foo />`) are references. The loader uses it to rewrite imported names into live namespace reads.
   - Visitor: `walk(ast, fn | visitor)`. A function is enter-for-all. An object has keys by type, group aliases (`Function` first, defined in the slot table), `{ enter, leave }` per key, and generic `enter`/`leave`. `walk` returns the new root (`===` if unchanged). A replacement from `leave` is postwalk; one from `enter` is prewalk (descend into the replacement's children without re-entering it, so nested macros expand with no loops). Selectors and visitor merging come later.
   - ESTree objects stay as the boundary with the outside world: the parser produces them and `emit` consumes them. The ESTree ↔ children conversion holds the only per-type slot table.
-  - `walk` visits comments too.
+  - `walk` visits comments too: list comments as siblings, leading comments right after their owner's `enter` with `ctx.key === 'comments'` and `ctx.parent` the owner. A replacement keeps the leading comments of the node it replaces, like the origin.
+  - `emit` prints leading comments as an `aside` Doc, which `head`/`text` skip, so checks on how a child starts still see code.
   - Later: an optional JSX API layer for building nodes.
 - **Quasiquote and `match`** (`src/quote/`, done): rewrite rules read as code: `const m = match(node, js\`$a + $b\`); if (m) return js\`add(${m.a}, ${m.b})\``.
   - `` js`...` `` reads a template once per call site (cached by `strings`), with placeholder identifiers in the holes, and returns nodes without origins (they inherit the call site's in `walk`). Grammar: expression first (`{ a }` is an object, `function f() {}` an expression), else one statement; `js.stmt` (strict, `{}` is a block), `js.stmts` (array). Raw template text is the source, so `'\n'` stays an escape.
@@ -58,3 +62,5 @@ A homoiconic runtime for JavaScript: code is data the program can read, change a
 - Tests: `pnpm test` (`node --test`; Node runs `.ts` directly). Imports use explicit `.ts` extensions. Don't add vitest.
 - Type-check: `pnpm exec tsc` (`noEmit`, `erasableSyntaxOnly`).
 - Discuss design with the user before coding new pieces.
+- Models: the main chat (Fable) is for decisions and architecture. Hand coding to subagents, and run every subagent with `model: "opus"`. The main chat writes the brief, reviews the result and runs the checks itself.
+- `specs/` holds project documents: `specs/decisions.md` is the decision log (append an entry when a design decision is made or reversed, with what was rejected and why); todos and plans go there too.

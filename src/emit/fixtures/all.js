@@ -150,3 +150,19 @@ let v
 ;`template`.length
 if (a) if (b) c()
 else d()
+
+// Block comments inside a statement lead the node right after them.
+const pure = /* @__PURE__ */ create()
+const chunk = import(/* webpackChunkName: "chunk" */ './chunk.js')
+if (/* first */ a == 0 /* then */) b()
+const sum = /* whole */ a + /* right */ b
+const grouped = (/* left */ a) + (/* inner */ b * c) * 2
+function annotated(a) /* body */ {
+  return /* value */ a
+}
+function multiline() {
+  return (/* one
+    two */ a)
+}
+;(/* statement */ f()).g()
+const part = `x${/* part */ y}z`
