@@ -90,9 +90,21 @@ describe('emit: comments', () => {
   ])
 })
 
+/** Exact output, plus both round-trip properties on it. */
+const roundTrips = (list: [src: string, out: string, filename?: string][]) => {
+  for (const [src, out, filename = 'input.js'] of list) {
+    test(JSON.stringify(src), () => {
+      const ast = read(src, { filename })
+      const code = emit(ast)
+      assert.equal(code, out + '\n')
+      assert.deepEqual(read(code, { filename }), ast, 'read(emit(ast)) must equal ast')
+      assert.equal(emit(read(code, { filename })), code, 'emit must be a fixed point')
+    })
+  }
+}
+
 describe('emit: leading comments', () => {
-  /** Exact output, plus both round-trip properties on it. */
-  const leading: [src: string, out: string, filename?: string][] = [
+  roundTrips([
     ['if (/* c */ a == 0) b()', 'if (/* c */ a == 0) b()'],
     ['const x = /* @__PURE__ */ f()', 'const x = /* @__PURE__ */ f()'],
     ['import(/* webpackChunkName: "x" */ "./x.js")', 'import(/* webpackChunkName: "x" */ "./x.js")'],
@@ -102,9 +114,6 @@ describe('emit: leading comments', () => {
     ['if (x /* c */) y()', 'if (x) /* c */ y()'],
     ['`${/* c */ x}`', '`${/* c */ x}`'],
     ['f(/* timeout */ 100)', 'f(/* timeout */ 100)'],
-    // Line comments hoist as before (this layout is the existing one for a line comment in `let a, b`).
-    ['const x = a + // why\n b', 'const \n  // why\n  x = a + b\n'],
-    ['x = a + // why\n b', '// why\nx = a + b'],
     ['x = /* a */ /* b */ y', 'x = /* a */ /* b */ y'],
     // A comment at the start of its parent's text stays inside parens.
     ['(/* c */ a) + b', '(/* c */ a) + b'],
@@ -133,16 +142,86 @@ describe('emit: leading comments', () => {
     ['type F = (a) /* c */ => R', 'type F = (a) /* c */ => R', 'a.ts'],
     ['let x = <a>{/* c */ y}</a>', 'let x = <a>{/* c */ y}</a>'],
     ['let x = <a></ /* c */ a>', 'let x = <a></ /* c */ a>'],
-  ]
-  for (const [src, out, filename = 'input.js'] of leading) {
-    test(JSON.stringify(src), () => {
-      const ast = read(src, { filename })
-      const code = emit(ast)
-      assert.equal(code, out + '\n')
-      assert.deepEqual(read(code, { filename }), ast, 'read(emit(ast)) must equal ast')
-      assert.equal(emit(read(code, { filename })), code, 'emit must be a fixed point')
-    })
-  }
+  ])
+})
+
+describe('emit: leading line comments', () => {
+  roundTrips([
+    // The line ends after the comment; the node goes on one level deeper.
+    ['const x = a + // why\n b', 'const x = a + // why\n  b'],
+    ['f(a, b + // c\n d)', 'f(a, b + // c\n  d)'],
+    ['if (x) // why\n  y()\nelse // no\n  z()', 'if (x) // why\n  y()\nelse // no\n  z()'],
+    ['x = a ? // c\n b : c', 'x = a ? // c\n  b : c'],
+    ['let f = () => // c\n {}', 'let f = () => // c\n  {}'],
+    ['class A { static // c\n m() {} }', 'class A {\n  static // c\n    m() {}\n}'],
+    ['let x: // c\n T', 'let x: // c\n  T', 'a.ts'],
+    ['type F = (a) // c\n => R', 'type F = (a) // c\n  => R', 'a.ts'],
+    // After `return`, `throw`, `yield` the line break would end the statement: parens.
+    ['function g() { return ( // c\n x) }', 'function g() {\n  return (// c\n    x)\n}'],
+    ['function g() { return (// c\n a).b }', 'function g() {\n  return (// c\n    a).b\n}'],
+    ['function g() { throw ( // c\n x) }', 'function g() {\n  throw (// c\n    x)\n}'],
+    ['function* g() { yield ( // c\n x) }', 'function* g() {\n  yield (// c\n    x)\n}'],
+    // A name after a dot: the comment goes before the dot (`a.` newline `b as T` doesn't parse in TS).
+    ['x = a // c\n .b as T', 'x = a // c\n  .b as T', 'a.ts'],
+    ['x = import.// c\n meta', 'x = import // c\n  .meta'],
+    ['let y: A.// c\n B', 'let y: A // c\n  .B', 'a.ts'],
+    ['x = <A// c\n.B c="1" />', 'x = <A // c\n  .B c="1" />', 'a.jsx'],
+    // Hoisted by `read` where the line break would change the code.
+    ['class A { static // c\n async m() {} }', 'class A {\n  // c\n  static async m() {}\n}'],
+    // Nothing after it: hoisted.
+    ['x = (a // c\n)', '// c\nx = a'],
+    // Comments between a statement and one that needs `;`: the `;` stays with the first.
+    ['a();\n// c\n[1].map(f)', 'a();\n// c\n[1].map(f)'],
+  ])
+})
+
+describe('emit: JSDoc casts keep their parentheses', () => {
+  roundTrips([
+    ['x = /** @type {T} */ (a).b', 'x = /** @type {T} */ (a).b'],
+    ['x = /** @type {T} */ (a.b)', 'x = /** @type {T} */ (a.b)'],
+    ['f(/** @type {T} */ (x))', 'f(/** @type {T} */ (x))'],
+    ['/** @type {T} */ (x).foo()', '/** @type {T} */ (x).foo()'],
+    ['a()\n;/** @type {T} */ (x).foo()', 'a()\n;/** @type {T} */ (x).foo()'],
+    ['/** @type {T} */ (function () {})()', '/** @type {T} */ (function () {})()'],
+    ['x = /** @type {T} */ (a + b) * c', 'x = /** @type {T} */ (a + b) * c'],
+    ['x = /** @satisfies {T} */ ({})', 'x = /** @satisfies {T} */ ({})'],
+    ['x = /** @type {A} */ (/** @type {B} */ (y))', 'x = /** @type {A} */ (/** @type {B} */ (y))'],
+    ['x = /**\n * @type {T}\n */ (y)', 'x = /**\n * @type {T}\n */ (y)'],
+    // The cast's parens replace the ones that keep a comment off the start of the parent.
+    ['x = (/** @type {T} */ a).b', 'x = /** @type {T} */ (a).b'],
+    ['x = (/* c */ /** @type {T} */ (a)).b', 'x = (/* c */ /** @type {T} */ (a)).b'],
+    ['x = /** @type {T} */ (/* c */ y)', 'x = /** @type {T} */ (/* c */ y)'],
+    // Parens even where the source had none (accepted cost).
+    ['x = /** @type {T} */ a', 'x = /** @type {T} */ (a)'],
+    ['x = /** @type {F} */ (a) => a', 'x = /** @type {F} */ ((a) => a)'],
+    ['function g() { return (/** @type {T}\n */ (x)) }', 'function g() {\n  return (/** @type {T}\n */ (x))\n}'],
+    // Not where parentheses can't go: patterns, literal types.
+    ['({ a: /** @type {T} */ (b) } = c)', '({ a: /** @type {T} */ b } = c)'],
+    ['type A = -/** @type {T} */ 1', 'type A = -/** @type {T} */ 1', 'a.ts'],
+    // A JSDoc before a statement is a statement comment; on its own line it is never a cast.
+    ['/** @type {T} */\nconst x = 1', '/** @type {T} */\nconst x = 1'],
+    ['/** @type {T} */\n(x).foo()', '/** @type {T} */\nx.foo()'],
+    // As a list comment it keeps a line break before a `(`.
+    ['x = [(a + b) * c /** @type {T} */]', 'x = [\n  /** @type {T} */\n  (a + b) * c,\n]'],
+    ['if (c /** @type {T} */) (a || b).d()', 'if (c) /** @type {T} */\n  (a || b).d()'],
+  ])
+})
+
+describe('emit: comments at the start of a bare list, around import specifiers', () => {
+  roundTrips([
+    ['(/* c */ a), b', '(/* c */ a), b'],
+    ['x = ((/* c */ a), b)', 'x = ((/* c */ a), b)'],
+    ['x = () => ((// c\n a), b)', 'x = () => ((// c\n  a), b)'],
+    ['for (;; i/* c */++, j--) {}', 'for (;; (/* c */ i++), j--) {}'],
+    ['type A = string /* c */ | number', 'type A = (/* c */ string) | number', 'a.ts'],
+    ["import x, /* c */ * as ns from 'x'", "import x, /* c */ * as ns from 'x'"],
+    ["import /* a */ x, /* b */ { /* c */ y } from 'x'", "import /* a */ /* b */ x, { /* c */ y } from 'x'"],
+    ["import x\n/* c */ from 'x'", "import x\n  /* c */\n  from 'x'"],
+    ["import x // c\nfrom 'x'", "import // c\n  x from 'x'"],
+    ['declare /* c */ global {}', 'declare /* c */ global {}', 'a.ts'],
+    ['switch (x) { default /* c */: y }', 'switch (x) {\n  default:\n    /* c */\n    y\n}'],
+    ['f(/* c */ (a))', 'f(/* c */ a)'],
+  ])
 })
 
 describe('emit: nodes built by hand', () => {
@@ -194,9 +273,22 @@ describe('emit: nodes built by hand', () => {
     assert.equal(emit({ type: 'ExpressionStatement', expression: pure }), '(/* @__PURE__ */ f())')
   })
 
-  test('a Line comment cannot lead a node', () => {
-    const ast = { type: 'Identifier', name: 'a', comments: [{ type: 'Comment', kind: 'Line', value: ' c' }] }
-    assert.throws(() => emit(ast), /a Line comment can't lead Identifier/)
+  test('a Line comment leads with a line break; where that would change the code, an error', () => {
+    const line = { type: 'Comment', kind: 'Line', value: ' c' }
+    const id = (name: string, comments?: object[]) => ({ type: 'Identifier', name, comments })
+    assert.equal(emit({ type: 'BinaryExpression', operator: '+', left: id('a'), right: id('b', [line]) }), 'a + // c\n  b')
+    assert.equal(emit({ type: 'ReturnStatement', argument: id('x', [line]) }), 'return (// c\n  x)')
+    assert.throws(() => emit({ type: 'BreakStatement', label: id('l', [line]) }), /a Line comment can't lead BreakStatement\.label/)
+    const value = { type: 'FunctionExpression', async: true, generator: false, params: [], body: { type: 'BlockStatement', body: [] } }
+    const method = { type: 'MethodDefinition', kind: 'method', static: false, computed: false, key: id('m', [line]), value }
+    assert.throws(() => emit({ type: 'ClassBody', body: [method] }), /MethodDefinition\.key/)
+  })
+
+  test('a JSDoc cast comment gets parens where an expression goes, not in a pattern', () => {
+    const cast = { type: 'Comment', kind: 'Block', value: '* @type {T} ' }
+    const x = { type: 'Identifier', name: 'x', comments: [cast] }
+    assert.equal(emit({ type: 'CallExpression', callee: { type: 'Identifier', name: 'f' }, arguments: [x], optional: false }), 'f(/** @type {T} */ (x))')
+    assert.equal(emit({ type: 'ArrayPattern', elements: [x] }), '[/** @type {T} */ x]')
   })
 })
 

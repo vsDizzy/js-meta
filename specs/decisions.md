@@ -163,3 +163,29 @@ Reverses "Rejected for now" in the 2026-11-18 comments entry. The trigger: hoist
 - **Rejected:** making every comment a leading comment and dropping Comment nodes from lists (the Babel model made canonical). It would fix `arguments.length` seeing comments, but a comment at the end of a block has no node to lead, and `ctx.prev` / `ctx.next` for JSDoc would go.
 - **Rejected for now:** line comments in place. `//` inside an expression needs a forced line break, and after `return` / `throw` that changes the meaning. They are still hoisted.
 - **Accepted cost:** two homes for comments (list sibling, `comments` attribute). Parentheses are not kept, so a JSDoc cast `/** @type {T} */ (x)` keeps its comment but loses the parentheses tsc needs.
+
+### Line comments outside lists stay in place
+
+Reverses "Rejected for now: line comments in place" in the entry above.
+
+- **Chosen:** a `//` comment in no list leads the node after it, like a block comment. `emit` prints it, breaks the line and indents the continuation. After `return` / `throw` / `yield` the argument goes in parentheses (`return (// c`). A name after a dot gets the comment before the dot, because TS does not parse `a.` + newline + `b as T`.
+- **Chosen:** where a line break would change the meaning and parentheses cannot help, `read` still hoists and `emit` throws for hand-built trees. One table (`sameLine()` in `src/read/comments.ts`): the label of `break` / `continue`, a member key after `async` / `accessor` / a TS modifier, the name after `asserts`, type parameters of an `async` arrow, a parameter property, the id of `type` / `interface` / `namespace`.
+- **Rejected:** turning such a line comment into a block comment. It changes the comment's kind, and `*/` in the text cannot be kept.
+
+### JSDoc casts keep their parentheses, nothing else does
+
+- **Chosen:** a block comment that starts with `* @type` or `* @satisfies` and is followed on the same line by a grouping `(` is a leading comment of the expression inside the parentheses (`a` in `/** @type {T} */ (a).b`). `emit` always prints such a node as `/** … */ (node)`.
+- **Rejected:** a `parenthesized` attribute on every node. `a+b` and `(a+b)` would be different trees, and `match` and `redefine` would have to ignore it.
+- **Rejected:** the comment on the outermost node that starts there, with parentheses around it. `/** @type {T} */ (a).b` would come back as a cast of `a.b`.
+- **Rejected:** any whitespace between the comment and `(`. A JSDoc comment printed on its own line before a statement or element that starts with `(` would read back as a cast. `emit` keeps a line break between a non-cast JSDoc and a following `(`.
+- **Accepted cost:** `x = /** @type {T} */ a` gets parentheses after `emit` and becomes a cast. A cast written with a line break before `(` is not kept.
+
+### A comment in a pattern is a requirement
+
+- **Chosen:** comments in the target are ignored unless the pattern has some. A pattern comment must be found in front of the node it leads (its `comments` plus the Comment siblings before it): same kind and trimmed text, or a variable (`/* $c */`, `/** $doc */` for JSDoc only, `/* $$cs */` for all). In a replacement template the same forms put the captures back; `/* ${c} */` is a comment hole in `js`. `match(node, pattern, ctx)` takes the walk `ctx` for the siblings before the root.
+- **Chosen:** a `$$a` run is the real slice of the list, comments included. Comments go with the element they are in front of; the last run also takes the list's trailing comments.
+- **Chosen:** a value put into a list through a hole brings its `comments` along as siblings before it, the form `read` gives.
+- **Rejected:** waiting for predicates in patterns. The text form reads as code and needs no new API.
+- **Rejected:** `$$a` as code only (the old behaviour). A rule `{ $$body }` → `{ $$body }` stripped the comments from the body.
+- **Rejected:** a greedy `$$` comment variable. It takes the gap between its neighbours' matches, so `/* $$a */ /* @x */ /* $$b */` has one answer.
+- **Rejected:** an error when a replacement moves a sibling comment. It is a documented copy until `walk` can replace the comments before a node.

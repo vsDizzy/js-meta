@@ -7,6 +7,12 @@
 // `${}` always means a value from JS: a node, an array of nodes (spliced into a
 // list), a string, number, boolean, null, bigint or RegExp. In a pattern, `$a`
 // is a variable, `$$a` a sequence in a list, `$_` / `$$_` match without capturing.
+//
+// Comments in a template stay in the nodes. Those around the root (before or
+// after it) go in front of it, in its `comments`: `js\`/* @__PURE__ */ $f()\``.
+// A comment that is just a hole stands for comments: `/* ${c} */` puts a
+// Comment node or an array of them there; in a replacement, `/* $c */` puts the
+// captured comment and `/* $$cs */` the captured ones.
 import { attrsOf, make, Node, slotsOf, toNode, type Slot } from '../ast/node.ts'
 import { originOf, setOrigin } from '../ast/origin.ts'
 import { read, ReadError } from '../read/index.ts'
@@ -49,7 +55,7 @@ function parse(strings: TemplateStringsArray, mode: Mode): Template {
   }
   const one = (list: Node[]) => {
     const code = list.filter((n) => !isComment(n))
-    if (code.length === 1) return code[0]
+    if (code.length === 1) return gather(list, code[0])
     throw new SyntaxError(`${code.length ? 'several statements' : 'nothing'} in ${shown}${code.length ? ': use js.stmts' : ''}`)
   }
 
@@ -59,8 +65,9 @@ function parse(strings: TemplateStringsArray, mode: Mode): Template {
     // (it becomes a declaration where a statement is put).
     let expr: Node | undefined
     try {
-      const code = statements(`(\n${text}\n)`).filter((n) => !isComment(n))
-      if (code.length === 1 && code[0].type === 'ExpressionStatement') expr = code[0].children[0] as Node
+      const list = statements(`(\n${text}\n)`)
+      const code = list.filter((n) => !isComment(n))
+      if (code.length === 1 && code[0].type === 'ExpressionStatement') expr = gather(list, code[0], code[0].children[0] as Node)
     } catch {}
     if (expr) tree = expr
     else {
@@ -85,34 +92,52 @@ function parse(strings: TemplateStringsArray, mode: Mode): Template {
   return { tree, prefix, shown }
 }
 
+/**
+ * `root` (the statement `stmt` of `list`, or its expression) with the comments
+ * around it in front: `read` puts some of them in the list (a line comment, one
+ * with nothing after it), but a template's root has no list.
+ */
+function gather(list: Node[], stmt: Node, root: Node = stmt): Node {
+  const i = list.indexOf(stmt)
+  const comments = [...list.slice(0, i), ...(root === stmt ? [] : leadOf(stmt)), ...leadOf(root), ...list.slice(i + 1)]
+  if (comments.length === leadOf(root).length) return root
+  // In source order: `read` leaves some in place and hoists others.
+  comments.sort((a, b) => (written.get(a) ?? 0) - (written.get(b) ?? 0))
+  return make(root.type, { ...attrsOf(root), comments }, root.children)
+}
+
+/** Where a template's comment was written in its text, to keep comments in source order. */
+const written = new WeakMap<Node, number>()
+
 /** A copy without origins: template nodes take the origin of what they replace. */
 function bare(node: Node): Node {
   const attrs = attrsOf(node)
   if (Array.isArray(attrs.comments)) attrs.comments = attrs.comments.map(bare)
+  if (node.type === 'Comment') {
+    const copy = make(node.type, attrs, node.children)
+    written.set(copy, originOf(node)?.start ?? 0)
+    return copy
+  }
   return make(node.type, attrs, node.children.map((s) => (Array.isArray(s) ? s.map((n) => n && bare(n)) : s && bare(s))))
 }
 
 const leadOf = (n: Node | null | undefined) => (n?.comments as Node[] | undefined) ?? []
 
-/** `node` with the leading comments of the hole it fills first: `/* @__PURE__ *\/ ${call}`. */
-function withLead(hole: Node, node: Node): Node {
-  // `{/* c */ ${kids}}`: the comment sits on the placeholder inside the wrapper.
-  const comments = [...leadOf(hole), ...(hole.type === 'JSXExpressionContainer' ? leadOf(hole.children[0] as Node) : [])]
-  if (!comments.length) return node
-  const out = make(node.type, { ...attrsOf(node), comments: [...comments, ...leadOf(node)] }, node.children)
-  const origin = originOf(node)
-  if (origin) setOrigin(out, origin)
-  return out
-}
-
 function checkStrings(tree: Node | Node[], prefix: string, shown: string) {
   const visit = (n: Node | null) => {
     if (!n) return
+    if (n.type === 'Comment') {
+      if (String(n.value).includes(prefix) && !commentName(n)?.startsWith(prefix)) {
+        throw new SyntaxError(`a \${} inside a comment in ${shown}: a comment can only be a hole as a whole, /* \${c} */`)
+      }
+      return
+    }
     const texts = [n.type === 'Literal' && typeof n.value === 'string' ? n.value : '', (n.value as { raw?: string })?.raw ?? '']
     if (n.type === 'JSXText') texts.push(String(n.value))
     if (texts.some((t) => typeof t === 'string' && t.includes(prefix))) {
       throw new SyntaxError(`a \${} inside a string or JSX text in ${shown}: put a whole node there instead`)
     }
+    leadOf(n).forEach(visit)
     for (const s of n.children) Array.isArray(s) ? s.forEach(visit) : visit(s)
   }
   Array.isArray(tree) ? tree.forEach(visit) : visit(tree)
@@ -192,18 +217,80 @@ function holeAt(node: Node, parent: Node, key: string, inList: boolean, inPatter
 
 const PATTERNS = new Set(['ObjectPattern', 'ArrayPattern', 'RestElement', 'AssignmentPattern'])
 
+/** Lists `read` puts no comments in (as in read/comments.ts): there a comment leads its element. */
+const NO_COMMENT_LISTS = new Set(['TemplateLiteral', 'TSTemplateLiteralType'])
+
+/** `node` with `comments` in front (none if empty): a copy that keeps the origin, or `node` if they are the same. */
+function setLead(node: Node, comments: Node[]): Node {
+  const now = leadOf(node)
+  if (now.length === comments.length && now.every((c, i) => c === comments[i])) return node
+  const attrs = attrsOf(node)
+  if (comments.length) attrs.comments = comments
+  else delete attrs.comments
+  const out = make(node.type, attrs, node.children)
+  const origin = originOf(node)
+  if (origin) setOrigin(out, origin)
+  return out
+}
+
+const isCommentValue = (v: unknown) => typeof v === 'object' && v !== null && (v as { type?: unknown }).type === 'Comment'
+
+/** What a comment hole stands for: a Comment node or an array of them. */
+function toComments(value: unknown, where: string): Node[] {
+  return (Array.isArray(value) ? value : [value]).map((c) => {
+    if (isCommentValue(c)) return toNode(c)
+    const what = typeof c === 'object' && c !== null && typeof (c as { type?: unknown }).type === 'string' ? `a ${(c as Node).type}` : typeof c
+    throw new TypeError(`${where} stands for a comment, but it is ${what}, not a Comment node`)
+  })
+}
+
 /** `tree` with the holes filled; untouched subtrees are shared. */
 function fill(tree: Node | Node[], h: Holes): Node | Node[] {
   const put = (hole: Hole, item: unknown) => coerce(item, hole, h)
+  /** The comments that comment `c` stands for, if it is a hole (`/* $c *\/`). */
+  const commentHole = (c: Node): Node[] | undefined => {
+    const name = commentName(c)
+    const key = name === undefined ? undefined : h.key(name)
+    return key === undefined ? undefined : toComments(h.value(key), `${h.label(key)} in ${h.shown}`)
+  }
+  /** `list` with its comment holes filled; the same array if it has none. */
+  const comments = (list: Node[]): Node[] => {
+    let changed = false
+    const out = list.flatMap((c) => {
+      const filled = commentHole(c)
+      if (filled) changed = true
+      return filled ?? [c]
+    })
+    return changed ? out : list
+  }
+  /** The leading comments of a hole, filled. */
+  const holeLead = (hole: Node) =>
+    // `{/* c */ ${kids}}`: the comment sits on the placeholder inside the wrapper.
+    comments([...leadOf(hole), ...(hole.type === 'JSXExpressionContainer' ? leadOf(hole.children[0] as Node) : [])])
+  /** `node` with the leading comments of the hole it fills first: `/* @__PURE__ *\/ ${call}`. */
+  const withLead = (hole: Node, node: Node): Node => {
+    const lead = holeLead(hole)
+    // A captured comment may already be on the captured node: `/* $c */ $call`.
+    return lead.length ? setLead(node, [...lead, ...leadOf(node).filter((c) => !lead.includes(c))]) : node
+  }
+  const root = make('Program', {}, [Array.isArray(tree) ? tree : [tree]])
   const visit = (node: Node, inPattern: boolean): Node => {
     const slots = slotsOf(node.type) ?? []
-    let changed = false
+    const own = leadOf(node)
+    const lead = comments(own)
+    let changed = lead !== own
     const children = node.children.map((slot, s): Slot => {
       const key = slots[s]
       const pattern = inPattern || PATTERNS.has(node.type) || !!NAME_SLOTS[node.type]?.includes(key)
       if (Array.isArray(slot)) {
         const out: (Node | null)[] = []
         for (const el of slot) {
+          if (el?.type === 'Comment') {
+            const filled = commentHole(el)
+            if (filled) changed = true
+            out.push(...(filled ?? [el]))
+            continue
+          }
           const hole = el && holeAt(el, node, key, true, pattern, h)
           if (!hole) {
             const next = el && visit(el, pattern)
@@ -213,9 +300,16 @@ function fill(tree: Node | Node[], h: Holes): Node | Node[] {
           }
           changed = true
           const v = h.value(hole.key)
-          const items = (Array.isArray(v) ? v : [v]).map((item) => put(hole, item))
-          if (items.length) items[0] = withLead(el, items[0])
-          out.push(...items)
+          // Comments in a run (`$$body`) stay comments, before the element they lead.
+          const items = (Array.isArray(v) ? v : [v]).map((item) => (isCommentValue(item) ? toNode(item) : put(hole, item)))
+          const first = items.findIndex((n) => n.type !== 'Comment')
+          if (first >= 0) items[first] = withLead(el, items[first])
+          else items.push(...holeLead(el))
+          // In a list the comments in front of an element are its siblings, as
+          // `read` gives them (and a line comment can only be printed there).
+          // Not in the template's own root, which is a single node.
+          const siblings = node !== root || Array.isArray(tree)
+          out.push(...(siblings && !NO_COMMENT_LISTS.has(node.type) ? items.flatMap((n) => [...leadOf(n), setLead(n, [])]) : items))
         }
         return out
       }
@@ -233,6 +327,8 @@ function fill(tree: Node | Node[], h: Holes): Node | Node[] {
     })
     if (!changed) return node
     const attrs = attrsOf(node)
+    if (lead.length) attrs.comments = lead
+    else delete attrs.comments
     // A key or member property that isn't a plain name becomes computed: `a.${'my-key'}` is `a['my-key']`.
     const keySlot = node.type === 'MemberExpression' ? 'property' : KEYED.has(node.type) ? 'key' : undefined
     if (keySlot && !attrs.computed) {
@@ -243,7 +339,6 @@ function fill(tree: Node | Node[], h: Holes): Node | Node[] {
   }
 
   // The root may itself be a hole: `js\`${x}\``.
-  const root = make('Program', {}, [Array.isArray(tree) ? tree : [tree]])
   const body = visit(root, false).children[0] as Node[]
   if (Array.isArray(tree)) return body
   if (body.length !== 1) throw new TypeError(`a hole spliced ${body.length} nodes where one goes, in ${h.shown}`)
@@ -259,6 +354,7 @@ function coerce(value: unknown, { key, role }: Hole, h: Holes): Node {
   const isNode = typeof value === 'object' && value !== null && !(value instanceof RegExp)
   if (isNode && typeof (value as { type?: unknown }).type !== 'string') throw new TypeError(`${where} is an object, not a node`)
   const node = isNode ? toNode(value) : undefined
+  if (node?.type === 'Comment') throw new TypeError(`${where} is a Comment: it goes in a list, or in a comment hole (/* $c */)`)
 
   switch (role) {
     case 'expression':
@@ -282,7 +378,7 @@ function coerce(value: unknown, { key, role }: Hole, h: Holes): Node {
       }
       throw new TypeError(`${where}: ${JSON.stringify(value)} can't be a property`)
     case 'member':
-      if (node && /^(MethodDefinition|PropertyDefinition|AccessorProperty|StaticBlock|Comment)$/.test(node.type)) return node
+      if (node && /^(MethodDefinition|PropertyDefinition|AccessorProperty|StaticBlock)$/.test(node.type)) return node
       throw new TypeError(`${where}: not a class member`)
     case 'jsxChild':
       if (node && /^JSX/.test(node.type)) return node
@@ -314,8 +410,10 @@ function asStatement(node: Node): Node {
   const id = (slotsOf(node.type) ?? []).includes('id') ? slotOf(node, 'id') : null
   if (node.type === 'FunctionExpression' && id) return retype(node, 'FunctionDeclaration')
   if (node.type === 'ClassExpression' && id) return retype(node, 'ClassDeclaration')
-  if (/Statement$|Declaration$/.test(node.type) || node.type === 'Comment') return node
-  return make('ExpressionStatement', {}, [node])
+  if (/Statement$|Declaration$/.test(node.type)) return node
+  // The comments in front of the expression go in front of the statement, as `read` puts them.
+  const comments = leadOf(node)
+  return make('ExpressionStatement', comments.length ? { comments } : {}, [setLead(node, [])])
 }
 
 const ident = (name: string) => make('Identifier', { name, optional: false }, [[], null])
@@ -384,6 +482,6 @@ export function substitute(template: Node | Node[], captures: Captures): Node | 
   })
 }
 
-import { variable, type Captures } from './match.ts'
-export { match, type Captures } from './match.ts'
+import { commentName, variable, type Captures } from './match.ts'
+export { match, type Captures, type MatchContext } from './match.ts'
 export { rule, rules, type Rule } from './rule.ts'

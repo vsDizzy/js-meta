@@ -40,7 +40,7 @@ match(node, js`f($$args)`)           // $$ captures a run of list elements
 ```
 
 - **`js`** reads its template once per call site. It parses as an expression first, else as one statement. Use `js.stmt` (where `{}` is a block) and `js.stmts` (an array) when you need them, and `js.id(name)` for an identifier.
-- **`match`** ignores comments, layout and literal spelling. A repeated variable must match equal code. `$_` and `$$_` match without capturing.
+- **`match`** ignores layout, literal spelling and comments the pattern doesn't ask for. A comment in the pattern is a requirement: `` js`/* @__PURE__ */ $call` `` needs that comment in front, `/* $c */` captures any comment, `/** $doc */` a JSDoc, `/* $$cs */` all of them. A repeated variable must match equal code. `$_` and `$$_` match without capturing.
 - **`rule(pattern, replacement)`** is a `walk` handler. The replacement is a template with the same `$` variables, a function of the captures, or `null` to remove the node. A rule fires outer forms first, like macroexpand, and nested forms expand inside the replacement. `rules(r1, r2, …)`: the first rule that fires wins.
 
 Replacements carry no positions of their own, so a source map points an expansion at its call site.

@@ -3,9 +3,16 @@
 //   literals from `raw` when present, parentheses from precedence,
 //   comments as nodes: own line in statement lists, inline in expression lists,
 //   and a node's leading comments (`comments`) right before it: `f(/* c */ a)`.
+//   A leading line comment ends its line and the node goes on, one level deeper:
+//   `x = a + // why` newline `  b`. Where that line break would end the statement
+//   (after `return`, `throw`, `yield`) the node goes in parentheses; where it
+//   would change the code otherwise (`sameLine` in read/comments.ts) emit throws.
+//   A JSDoc cast keeps its parentheses: `/** @type {T} */ (x)` (also when the
+//   source had none: `x = /** @type {T} */ a` gets them).
 // Printers are plain functions `node -> Doc` (doc.ts), one per node type
 // (PRINTERS); the renderer turns the Doc into text and, if asked, a source map.
 import { toNode, type Node } from '../ast/node.ts'
+import { isCast, sameLine } from '../read/comments.ts'
 import { aside, hardline, head, indent, join, mark, render, text, type Doc } from './doc.ts'
 import { MapBuilder, type SourceMap } from './sourcemap.ts'
 
@@ -19,9 +26,14 @@ type N = any
 interface Ctx {
   /** Inside a `for (init;;)`: a bare `in` would be read as for-in. */
   noIn?: boolean
+  /** A property of an object pattern: its value is a target, which takes no parentheses. */
+  pattern?: boolean
+  /** A literal type (`-1`): no parentheses, so no cast form. */
+  noCast?: boolean
 }
 
 const PLAIN: Ctx = {}
+const PATTERN: Ctx = { pattern: true }
 
 function doc(input: Node | object): Doc {
   const ast = toNode(input)
@@ -49,15 +61,23 @@ const wrapOnce = new WeakSet<object>()
 
 /** Prints a node with its leading comments; `leading: false` leaves them to the caller. */
 function print(node: N, ctx: Ctx, leading = true): Doc {
+  // Comments inside the parens (before them they would lead the parent); the
+  // mark starts at the node itself, so a name maps where it is written.
+  const wrap = wrapOnce.delete(node)
+  const own = printOwn(node, wrap ? PLAIN : ctx)
+  const comments: N[] = node.comments ?? []
+  // Not printed as a cast here (`cast` is for expressions), so a JSDoc cast stays apart from a `(`.
+  const doc = leading ? withComments(comments, own, { breakLast: castBeforeParen(comments, own) }) : own
+  return wrap ? ['(', doc, ')'] : doc
+}
+
+/** The node's own text, marked, without its leading comments. */
+function printOwn(node: N, ctx: Ctx): Doc {
   const printer = PRINTERS[node.type]
   if (!printer) throw new Error(`emit: unknown node type "${node.type}"`)
   const first = startChild(node)
   if (first && hasLead(first)) wrapOnce.add(first)
-  const comments = leading ? lead(node) : ''
-  // Comments inside the parens (before them they would lead the parent); the
-  // mark starts at the node itself, so a name maps where it is written.
-  if (wrapOnce.delete(node)) return ['(', comments, mark(node, printer(node, PLAIN)), ')']
-  return [comments, mark(node, printer(node, ctx))]
+  return mark(node, printer(node, ctx))
 }
 
 /**
@@ -213,8 +233,12 @@ function parens(node: N): Doc {
   return ['(', print(node, PLAIN), ')']
 }
 
+/** An expression in parens; a cast brings its own. */
+const exprParens = (node: N): Doc => (isCastNode(node) ? cast(node) : parens(node))
+
 /** `node` as an operand that must bind at least as tight as `min`. */
 function expr(node: N, ctx: Ctx, min = P.SEQ): Doc {
+  if (!ctx.noCast && isCastNode(node)) return cast(node)
   const wrap = prec(node) < min || (ctx.noIn && node.type === 'BinaryExpression' && node.operator === 'in')
   return wrap ? parens(node) : print(node, ctx)
 }
@@ -222,7 +246,7 @@ function expr(node: N, ctx: Ctx, min = P.SEQ): Doc {
 /** Object of a member access, callee, tag: a left-hand-side expression. */
 function lhs(node: N, ctx: Ctx): Doc {
   // `(a?.b).c` ends the chain; without parens it would continue it.
-  if (node.type === 'ChainExpression') return parens(node)
+  if (node.type === 'ChainExpression') return exprParens(node)
   return expr(node, ctx, P.CALL)
 }
 
@@ -245,31 +269,87 @@ const comment = (c: N): Doc => mark(c, commentText(c))
 const isComment = (n: N) => n !== null && n.type === 'Comment'
 
 const hasLead = (n: N): boolean => !!n?.comments?.length
+const hasLineComment = (comments: N[]) => comments.some((c) => c.kind === 'Line')
 
 /**
- * `/* c *\/ ` before a node: its leading comments, inline. Not code to `head`, so
- * checks like "starts with `{`" see through them. Only block comments: a line
- * comment would swallow the rest of the line.
+ * `doc` after leading comments: `/* c *\/ ` inline; `// c` ends its line and the
+ * rest goes one level deeper (`breakLast`: the last comment too). The comments
+ * are an aside, not code to `head`, so checks like "starts with `{`" see through them.
  */
-function lead(n: N): Doc {
-  if (!hasLead(n)) return ''
-  return aside(
-    (n.comments as N[]).map((c) => {
-      if (c.kind !== 'Block') throw new Error(`emit: a ${c.kind} comment can't lead ${n.type} (it would end the line), only a Block comment`)
-      return [comment(c), ' ']
-    }),
-  )
+function withComments(comments: N[], doc: Doc, { breakLast = false } = {}): Doc {
+  if (!comments.length) return doc
+  const breaks = (c: N, i: number) => c.kind === 'Line' || (breakLast && i === comments.length - 1)
+  const i = comments.findIndex(breaks)
+  const lines = (cs: N[], from: number): Doc => cs.map((c, j) => [comment(c), breaks(c, from + j) ? hardline : ' '])
+  if (i < 0) return [aside(lines(comments, 0)), doc]
+  return [aside(lines(comments.slice(0, i + 1), 0)), indent([aside(lines(comments.slice(i + 1), i + 1)), doc])]
 }
 
-/** ` /* c *\/ ` where the node follows text with no space (`f /* c *\/ <T>()`, `x /* c *\/ : T`). */
-const leadAfter = (n: N): Doc => (hasLead(n) ? [' ', lead(n)] : '')
+/**
+ * The last of `comments` is a JSDoc cast and `doc` starts with `(`: on one line
+ * they would read as a cast of what is in those parens. Comments that are not
+ * the node's own cast (list comments) keep a line break between.
+ */
+const castBeforeParen = (comments: N[], doc: Doc): boolean =>
+  comments.length > 0 && isCast(comments.at(-1)) && render(doc).startsWith('(')
+
+/** ` /* c *\/ ` then `doc`, where the node follows text with no space (`f /* c *\/ <T>()`, `x /* c *\/ : T`). */
+const afterLead = (n: N, doc: Doc): Doc => (hasLead(n) ? [' ', withComments(n.comments, doc)] : doc)
 /** A space before a child that `print` gives leading comments: `< /* c *\/ a>`, not `</* c *\/ a>`. */
 const spaceBefore = (n: N): Doc => (hasLead(n) ? ' ' : '')
 
-/** After `return`/`throw`/`yield` a line break ends the statement: a multi-line comment goes in parens. */
+/** Throws if a line comment leads the child in slot `key`, where the line break would change the code. */
+function sameLineChild(parent: N, key: string) {
+  const child = parent[key]
+  if (child && hasLineComment(child.comments ?? []) && sameLine(parent, key)) {
+    throw new Error(`emit: a Line comment can't lead ${parent.type}.${key}: the line break after it would change the code`)
+  }
+}
+
+/** Patterns can't be parenthesized, so no cast form for them. */
+const PATTERN_TYPES = /^(ObjectPattern|ArrayPattern|AssignmentPattern|RestElement)$/
+/** Led by a JSDoc cast (`isCast`): printed `/** @type {T} *\/ (node)` where an expression goes. */
+const isCastNode = (n: N): boolean => hasLead(n) && n.comments.some(isCast) && !PATTERN_TYPES.test(n.type)
+
+/**
+ * `/** @type {T} *\/ (node)`: tsc needs the parentheses. Each cast comment opens
+ * parentheses that close after the node, with the comments after it inside.
+ * These also serve precedence and a pending wrap, unless comments come before
+ * the first cast: at the start of the parent they would lead it, so
+ * `(/* c *\/ /** @type {T} *\/ (a)).b`.
+ */
+function cast(node: N): Doc {
+  const wrap = wrapOnce.delete(node)
+  const cs: N[] = node.comments
+  let doc = printOwn(node, PLAIN)
+  let end = cs.length
+  for (let i = cs.length - 1; i >= 0; i--) {
+    if (!isCast(cs[i])) continue
+    doc = ['(', withComments(cs.slice(i + 1, end), doc), ')']
+    end = i + 1
+  }
+  doc = withComments(cs.slice(0, end), doc)
+  return wrap && !isCast(cs[0]) ? ['(', doc, ')'] : doc
+}
+
+/**
+ * After `return`/`throw`/`yield` a line break ends the statement. Does the text
+ * of `n` start with comments that break the line? A child that starts it is
+ * wrapped in parens (`startChild`) unless a cast comes first.
+ */
 const LINE_BREAK = new RegExp(`[\\n\\r${String.fromCharCode(0x2028, 0x2029)}]`)
-const breaksLine = (n: N): boolean => !!n?.comments?.some((c: N) => LINE_BREAK.test(c.value))
-const restricted = (n: N, ctx: Ctx, min = P.SEQ): Doc => (breaksLine(n) ? parens(n) : expr(n, ctx, min))
+function breaksLine(n: N): boolean {
+  for (let first = true; n; first = false, n = n.type === 'ChainExpression' ? n.expression : startChild(n)) {
+    const cs: N[] = n.comments ?? []
+    if (!cs.length) continue
+    if (!first && !isCast(cs[0])) return false
+    // A cast's parentheses come right after it.
+    const end = isCastNode(n) ? cs.findIndex(isCast) + 1 : cs.length
+    return cs.slice(0, end).some((c) => c.kind === 'Line' || LINE_BREAK.test(c.value))
+  }
+  return false
+}
+const restricted = (n: N, ctx: Ctx, min = P.SEQ): Doc => (breaksLine(n) ? ['(', expr(n, PLAIN), ')'] : expr(n, ctx, min))
 
 interface ListOptions {
   open: string
@@ -286,25 +366,29 @@ interface ListOptions {
 
 /**
  * Items inline: `(a, /* c *\/ b)`. One per line when a line comment needs a line
- * break or comments end the list (inline they would read as the last item's).
+ * break, comments end the list (inline they would read as the last item's), or
+ * a JSDoc cast comment comes right before an item that starts with `(` (inline
+ * it would read as a cast of what is in those parens).
  */
 function list(items: N[], ctx: Ctx, item: (n: N, ctx: Ctx) => Doc, o: ListOptions): Doc {
   const { open, close, sep = ',', pad = false, trailing = true, bare = false } = o
-  const groups: { comments: N[]; node: N }[] = []
+  const groups: { comments: N[]; node: N; doc: Doc }[] = []
   let pending: N[] = []
+  const inner = bare ? ctx : PLAIN
   for (const n of items) {
     if (isComment(n)) pending.push(n)
     else {
-      groups.push({ comments: pending, node: n })
+      groups.push({ comments: pending, node: n, doc: n === null ? '' : item(n, inner) })
       pending = []
     }
   }
   if (!groups.length && !pending.length) return open + close
 
-  const multiline = pending.length > 0 || groups.some((g) => g.comments.some((c) => c.kind === 'Line'))
+  const multiline =
+    pending.length > 0 ||
+    groups.some((g) => g.comments.some((c) => c.kind === 'Line') || castBeforeParen(g.comments, g.doc))
   if (!multiline) {
-    const inline = bare ? ctx : PLAIN
-    const s: Doc[] = join(`${sep} `, groups.map((g) => join(' ', [...g.comments.map(comment), item(g.node, inline)])))
+    const s: Doc[] = join(`${sep} `, groups.map((g) => join(' ', [...g.comments.map(comment), g.doc])))
     if (groups.at(-1)!.node === null) s.push(sep) // `[a, ,]`: a trailing hole needs its comma
     return pad ? [open, ' ', s, ' ', close] : [open, s, close]
   }
@@ -314,10 +398,29 @@ function list(items: N[], ctx: Ctx, item: (n: N, ctx: Ctx) => Doc, o: ListOption
     for (const c of g.comments) lines.push(comment(c))
     const last = i === groups.length - 1
     const end = last && (!trailing || g.node?.type === 'RestElement') ? '' : sep.trim()
-    lines.push([g.node === null ? '' : item(g.node, PLAIN), end])
+    lines.push([g.doc, end])
   })
   for (const c of pending) lines.push(comment(c))
   return [open, indent([hardline, join(hardline, lines)]), hardline, close]
+}
+
+/**
+ * A list with no brackets of its own that starts its node's text (`a, b`,
+ * `A | B`): comments before the first item would lead the whole node when read
+ * back, so they go in parens with it: `(/* c *\/ a), b`. `inner` prints that item.
+ */
+function bareList(items: N[], ctx: Ctx, item: (n: N, ctx: Ctx) => Doc, inner: (n: N) => Doc, o: ListOptions): Doc {
+  const i = items.findIndex((x) => !isComment(x))
+  if (i <= 0) return list(items, ctx, item, o)
+  const comments = items.slice(0, i)
+  let first = true
+  const each = (n: N, c: Ctx): Doc => {
+    if (!first) return item(n, c)
+    first = false
+    const doc = inner(n)
+    return ['(', withComments(comments, doc, { breakLast: castBeforeParen(comments, doc) }), ')']
+  }
+  return list(items.slice(i), ctx, each, o)
 }
 
 const exprItem = (n: N, ctx: Ctx): Doc => (n === null ? '' : expr(n, ctx, P.ASSIGN))
@@ -382,15 +485,22 @@ function stmts(items: N[], ctx: Ctx, { asi = true } = {}): Doc {
   const lines: Doc[] = []
   let pending: Doc[] = []
   let prev: N | undefined
+  /** Index of the line of `prev`. */
+  let at = -1
   for (const n of items) {
     if (isComment(n)) {
       pending.push(comment(n))
       continue
     }
     let s = print(n, ctx)
-    if (asi && prev && openEnd(prev) && ASI_HAZARD.test(head(s, 1))) s = [';', s]
+    if (asi && prev && openEnd(prev) && ASI_HAZARD.test(head(s, 1))) {
+      // `;(a)`; after comments a `;` there would end `prev` and take the comments with it.
+      if (pending.length) lines[at] = [lines[at], ';']
+      else s = [';', s]
+    }
     if (prev && (spaced(prev) || spaced(n))) lines.push('')
     lines.push(...pending, s)
+    at = lines.length - 1
     pending = []
     prev = n
   }
@@ -442,13 +552,13 @@ function literal(n: N): string {
 // print its leading comments themselves.
 
 /** `: T` */
-const ann = (n: N): Doc => (n ? [leadAfter(n), ': ', type(n.typeAnnotation)] : '')
+const ann = (n: N): Doc => (n ? afterLead(n, [': ', type(n.typeAnnotation)]) : '')
 
-const typeParams = (n: N, ctx: Ctx): Doc => (n ? [leadAfter(n), list(n.params, ctx, nodeItem, { open: '<', close: '>' })] : '')
-const typeArgs = (n: N, ctx: Ctx): Doc => (n ? [leadAfter(n), list(n.params, ctx, typeItem, { open: '<', close: '>' })] : '')
+const typeParams = (n: N, ctx: Ctx): Doc => (n ? afterLead(n, list(n.params, ctx, nodeItem, { open: '<', close: '>' })) : '')
+const typeArgs = (n: N, ctx: Ctx): Doc => (n ? afterLead(n, list(n.params, ctx, typeItem, { open: '<', close: '>' })) : '')
 
 /** A function's block body, `{ ... }`. */
-const fnBody = (n: N): Doc => [lead(n), block(n.body)]
+const fnBody = (n: N): Doc => withComments(n.comments ?? [], block(n.body))
 
 function decorators(items: N[] | undefined, ctx: Ctx): Doc {
   if (!items?.length) return ''
@@ -476,15 +586,14 @@ function method(n: N, ctx: Ctx, prefix: string): Doc {
   if (f.async) words += 'async '
   if (n.kind === 'get' || n.kind === 'set') words += n.kind + ' '
   if (f.generator) words += '*'
+  sameLineChild(n, 'key')
   return [
     decorators(n.decorators, ctx),
     words,
     f.generator ? spaceBefore(n.key) : '',
     key(n, ctx),
     n.optional ? '?' : '',
-    leadAfter(f),
-    signature(f, ctx),
-    f.body ? [' ', fnBody(f.body)] : '',
+    afterLead(f, [signature(f, ctx), f.body ? [' ', fnBody(f.body)] : '']),
   ]
 }
 
@@ -606,8 +715,8 @@ const PRINTERS: Record<string, Printer> = {
   DebuggerStatement: () => 'debugger',
   ReturnStatement: (n, ctx) => ['return', n.argument ? [' ', restricted(n.argument, ctx)] : ''],
   ThrowStatement: (n, ctx) => ['throw ', restricted(n.argument, ctx)],
-  BreakStatement: (n, ctx) => ['break', n.label ? [' ', print(n.label, ctx)] : ''],
-  ContinueStatement: (n, ctx) => ['continue', n.label ? [' ', print(n.label, ctx)] : ''],
+  BreakStatement: (n, ctx) => ['break', label(n, ctx)],
+  ContinueStatement: (n, ctx) => ['continue', label(n, ctx)],
   LabeledStatement: (n, ctx) => [print(n.label, ctx), ':', body(n.body)],
   WithStatement: (n) => ['with (', expr(n.object, PLAIN), ')', body(n.body)],
   WhileStatement: (n) => ['while (', expr(n.test, PLAIN), ')', body(n.body)],
@@ -679,7 +788,7 @@ const PRINTERS: Record<string, Printer> = {
   Decorator(n, ctx) {
     const e = n.expression
     const simple = /^(Identifier|MemberExpression|CallExpression)$/.test(e.type) && !hasComputed(e)
-    return ['@', simple ? print(e, ctx) : parens(e)]
+    return ['@', simple && !isCastNode(e) ? print(e, ctx) : exprParens(e)]
   },
 
   // --- modules ---
@@ -688,10 +797,22 @@ const PRINTERS: Record<string, Printer> = {
     const specs: N[] = n.specifiers
     // `import {} from 'x'` and `import 'x'` are one AST; the short form wins.
     if (!specs.some((x) => !isComment(x))) return [s, print(n.source, ctx), attributes(n, ctx)]
-    const named = specs.filter((x) => x.type === 'ImportSpecifier' || isComment(x))
-    const front = specs.filter((x) => x.type === 'ImportDefaultSpecifier' || x.type === 'ImportNamespaceSpecifier')
-    const parts: Doc[] = front.map((x) => print(x, ctx))
-    if (named.some((x) => !isComment(x))) parts.push(list(named, ctx, nodeItem, { open: '{', close: '}', pad: true }))
+    // Default and namespace first, each after its comments; the rest in braces.
+    const parts: Doc[] = []
+    const named: N[] = []
+    let pending: N[] = []
+    for (const x of specs) {
+      if (isComment(x)) pending.push(x)
+      else if (x.type === 'ImportSpecifier') named.push(...pending, x)
+      else parts.push(withComments(pending, print(x, ctx)))
+      if (!isComment(x)) pending = []
+    }
+    if (named.length) parts.push(list([...named, ...pending], ctx, nodeItem, { open: '{', close: '}', pad: true }))
+    else if (pending.length) {
+      // Comments after the last specifier, before `from`: own lines keep them at the end of the list.
+      const after = join(hardline, pending.map(comment))
+      return [s, join(', ', parts), indent([hardline, after, hardline, 'from ', print(n.source, ctx), attributes(n, ctx)])]
+    }
     return [s, join(', ', parts), importSource(n, ctx)]
   },
   ImportDefaultSpecifier: (n, ctx) => print(n.local, ctx),
@@ -735,7 +856,7 @@ const PRINTERS: Record<string, Printer> = {
   Literal: literal,
   ThisExpression: () => 'this',
   Super: () => 'super',
-  MetaProperty: (n, ctx) => [print(n.meta, ctx), '.', print(n.property, ctx)],
+  MetaProperty: (n, ctx) => [print(n.meta, ctx), dot('.', n.property, ctx)],
   TemplateLiteral: (n) => template(n.quasis, n.expressions, (e) => expr(e, PLAIN)),
   TemplateElement: (n) => n.value.raw,
   TaggedTemplateExpression: (n, ctx) =>
@@ -743,11 +864,13 @@ const PRINTERS: Record<string, Printer> = {
   ArrayExpression: (n, ctx) => list(n.elements, ctx, exprItem, { open: '[', close: ']' }),
   ArrayPattern: (n, ctx) => binding(n, ctx, list(n.elements, ctx, nodeItem, { open: '[', close: ']' })),
   ObjectExpression: (n, ctx) => list(n.properties, ctx, nodeItem, { open: '{', close: '}', pad: true }),
-  ObjectPattern: (n, ctx) => binding(n, ctx, list(n.properties, ctx, nodeItem, { open: '{', close: '}', pad: true })),
+  ObjectPattern: (n, ctx) =>
+    binding(n, ctx, list(n.properties, ctx, (p) => print(p, PATTERN), { open: '{', close: '}', pad: true })),
   Property(n, ctx) {
     if (n.method || n.kind === 'get' || n.kind === 'set') return method(n, ctx, '')
-    if (n.shorthand) return print(n.value, ctx)
-    return [key(n, ctx), ': ', expr(n.value, ctx, P.ASSIGN)]
+    if (n.shorthand) return print(n.value, PLAIN)
+    // In a pattern the value is a target: printed as is, never in parens (no cast form).
+    return [key(n, PLAIN), ': ', ctx.pattern ? print(n.value, PLAIN) : expr(n.value, ctx, P.ASSIGN)]
   },
   SpreadElement: (n, ctx) => ['...', expr(n.argument, ctx, P.ASSIGN)],
   RestElement: (n, ctx) => binding(n, ctx, ['...', print(n.argument, ctx)]),
@@ -756,17 +879,18 @@ const PRINTERS: Record<string, Printer> = {
     const out: Doc[] = [n.async ? 'async ' : '']
     // `<T,>`: a bare `<T>` would start JSX in .tsx files.
     const tp = n.typeParameters
+    sameLineChild(n, 'typeParameters')
     if (tp?.params.length === 1 && !tp.params[0].constraint && !isComment(tp.params[0])) {
-      out.push(lead(tp), mark(tp, ['<', print(tp.params[0], ctx), ',>']))
-    } else if (tp) out.push(lead(tp), list(tp.params, ctx, nodeItem, { open: '<', close: '>' }))
+      out.push(withComments(tp.comments ?? [], mark(tp, ['<', print(tp.params[0], ctx), ',>'])))
+    } else if (tp) out.push(withComments(tp.comments ?? [], list(tp.params, ctx, nodeItem, { open: '<', close: '>' })))
     out.push(params(n.params, ctx), ann(n.returnType), ' => ')
-    if (n.body.type === 'BlockStatement') return [out, lead(n.body), mark(n.body, block(n.body.body))]
+    if (n.body.type === 'BlockStatement') return [out, withComments(n.body.comments ?? [], mark(n.body, block(n.body.body)))]
     wrapLeftmost(n.body, /^ObjectExpression$/)
     const b = expr(n.body, ctx, P.ASSIGN)
     return [out, head(b, 1) === '{' ? ['(', b, ')'] : b]
   },
   SequenceExpression: (n, ctx) =>
-    list(n.expressions, ctx, exprItem, { open: '', close: '', trailing: false, bare: true }),
+    bareList(n.expressions, ctx, exprItem, (e) => expr(e, PLAIN), { open: '', close: '', trailing: false, bare: true }),
   AssignmentExpression: (n, ctx) => [expr(n.left, ctx, P.CALL), ` ${n.operator} `, expr(n.right, ctx, P.ASSIGN)],
   ConditionalExpression: (n, ctx) => [
     expr(n.test, ctx, P.NULLISH),
@@ -794,7 +918,7 @@ const PRINTERS: Record<string, Printer> = {
   CallExpression: (n, ctx) =>
     [lhs(n.callee, ctx), n.optional ? '?.' : '', typeArgs(n.typeArguments, ctx), args(n.arguments, ctx)],
   NewExpression(n, ctx) {
-    const callee = hasCall(n.callee) ? parens(n.callee) : lhs(n.callee, ctx)
+    const callee = hasCall(n.callee) ? exprParens(n.callee) : lhs(n.callee, ctx)
     return ['new ', callee, typeArgs(n.typeArguments, ctx), args(n.arguments, ctx)]
   },
   MemberExpression(n, ctx) {
@@ -802,7 +926,7 @@ const PRINTERS: Record<string, Printer> = {
     // `1.toString()` would read `1.` as the number.
     if (n.object.type === 'Literal' && /^\d+$/.test(text(obj))) obj = ['(', obj, ')']
     if (n.computed) return [obj, n.optional ? '?.' : '', '[', expr(n.property, PLAIN), ']']
-    return [obj, n.optional ? '?.' : '.', print(n.property, ctx)]
+    return [obj, dot(n.optional ? '?.' : '.', n.property, ctx)]
   },
   ChainExpression: (n, ctx) => print(n.expression, ctx),
   ImportExpression: (n, ctx) => ['import', args(n.options ? [n.source, n.options] : [n.source], ctx)],
@@ -828,7 +952,7 @@ const PRINTERS: Record<string, Printer> = {
   JSXText: (n) => n.raw,
   JSXIdentifier: (n) => n.name,
   JSXNamespacedName: (n, ctx) => [print(n.namespace, ctx), ':', print(n.name, ctx)],
-  JSXMemberExpression: (n, ctx) => [print(n.object, ctx), '.', print(n.property, ctx)],
+  JSXMemberExpression: (n, ctx) => [print(n.object, ctx), dot('.', n.property, ctx)],
 
   // --- TypeScript: expressions and declarations ---
   TSAsExpression: (n, ctx) => [expr(n.expression, ctx, P.AS), ' as ', type(n.typeAnnotation)],
@@ -836,16 +960,23 @@ const PRINTERS: Record<string, Printer> = {
   TSNonNullExpression: (n, ctx) => [lhs(n.expression, ctx), '!'],
   TSTypeAssertion: (n, ctx) => ['<', type(n.typeAnnotation), '>', expr(n.expression, ctx, P.UNARY)],
   TSInstantiationExpression: (n, ctx) => [lhs(n.expression, ctx), typeArgs(n.typeArguments, ctx)],
-  TSParameterProperty: (n, ctx) => [decorators(n.decorators, ctx), modifiers(n), print(n.parameter, ctx)],
-  TSTypeAliasDeclaration: (n, ctx) => [
-    n.declare ? 'declare ' : '',
-    'type ',
-    print(n.id, ctx),
-    typeParams(n.typeParameters, ctx),
-    ' = ',
-    type(n.typeAnnotation),
-  ],
+  TSParameterProperty(n, ctx) {
+    sameLineChild(n, 'parameter')
+    return [decorators(n.decorators, ctx), modifiers(n), print(n.parameter, ctx)]
+  },
+  TSTypeAliasDeclaration(n, ctx) {
+    sameLineChild(n, 'id')
+    return [
+      n.declare ? 'declare ' : '',
+      'type ',
+      print(n.id, ctx),
+      typeParams(n.typeParameters, ctx),
+      ' = ',
+      type(n.typeAnnotation),
+    ]
+  },
   TSInterfaceDeclaration(n, ctx) {
+    sameLineChild(n, 'id')
     const out: Doc[] = [n.declare ? 'declare ' : '', 'interface ', print(n.id, ctx), typeParams(n.typeParameters, ctx)]
     if (n.extends?.length) out.push(' extends ', list(n.extends, ctx, nodeItem, { open: '', close: '', trailing: false }))
     out.push(' ', print(n.body, ctx))
@@ -862,7 +993,12 @@ const PRINTERS: Record<string, Printer> = {
     n.initializer ? [' = ', expr(n.initializer, ctx, P.ASSIGN)] : '',
   ],
   TSModuleDeclaration(n, ctx) {
-    const head: Doc = [n.declare ? 'declare ' : '', n.kind === 'global' ? 'global' : [n.kind, ' ', print(n.id, ctx)]]
+    sameLineChild(n, 'id')
+    // `declare global`: the id is the word itself, with its comments.
+    let name: Doc = 'global'
+    if (n.kind !== 'global') name = [n.kind, ' ', print(n.id, ctx)]
+    else if (n.id?.name === 'global') name = print(n.id, ctx)
+    const head: Doc = [n.declare ? 'declare ' : '', name]
     return n.body ? [head, ' ', print(n.body, ctx)] : head
   },
   TSModuleBlock: (n) => block(n.body),
@@ -888,11 +1024,11 @@ const PRINTERS: Record<string, Printer> = {
 
   // --- TypeScript: types ---
   TSTypeReference: (n, ctx) => [print(n.typeName, ctx), typeArgs(n.typeArguments, ctx)],
-  TSQualifiedName: (n, ctx) => [print(n.left, ctx), '.', print(n.right, ctx)],
+  TSQualifiedName: (n, ctx) => [print(n.left, ctx), dot('.', n.right, ctx)],
   TSUnionType: (n, ctx) =>
-    list(n.types, ctx, (t) => type(t, T.INTERSECTION), { open: '', close: '', sep: ' |', trailing: false }),
+    bareList(n.types, ctx, (t) => type(t, T.INTERSECTION), typeItem, { open: '', close: '', sep: ' |', trailing: false }),
   TSIntersectionType: (n, ctx) =>
-    list(n.types, ctx, (t) => type(t, T.OPERATOR), { open: '', close: '', sep: ' &', trailing: false }),
+    bareList(n.types, ctx, (t) => type(t, T.OPERATOR), typeItem, { open: '', close: '', sep: ' &', trailing: false }),
   TSArrayType: (n) => [type(n.elementType, T.POSTFIX), '[]'],
   TSIndexedAccessType: (n) => [type(n.objectType, T.POSTFIX), '[', type(n.indexType), ']'],
   TSTypeOperator: (n) => [n.operator, ' ', type(n.typeAnnotation, T.OPERATOR)],
@@ -910,8 +1046,10 @@ const PRINTERS: Record<string, Printer> = {
   TSConstructorType: (n, ctx) =>
     [n.abstract ? 'abstract ' : '', 'new ', signatureNoReturn(n, ctx), arrowReturn(n.returnType)],
   TSTypeLiteral: (n, ctx) => typeMembers(n.members, ctx),
-  TSPropertySignature: (n, ctx) =>
-    [n.readonly ? 'readonly ' : '', key(n, ctx), n.optional ? '?' : '', ann(n.typeAnnotation)],
+  TSPropertySignature(n, ctx) {
+    sameLineChild(n, 'key')
+    return [n.readonly ? 'readonly ' : '', key(n, ctx), n.optional ? '?' : '', ann(n.typeAnnotation)]
+  },
   TSMethodSignature(n, ctx) {
     const kind = n.kind === 'get' || n.kind === 'set' ? n.kind + ' ' : ''
     return [kind, key(n, ctx), n.optional ? '?' : '', signature(n, ctx)]
@@ -937,34 +1075,53 @@ const PRINTERS: Record<string, Printer> = {
   TSNamedTupleMember: (n, ctx) => [print(n.label, ctx), n.optional ? '?' : '', ': ', type(n.elementType)],
   TSOptionalType: (n) => [type(n.typeAnnotation, T.POSTFIX), '?'],
   TSRestType: (n) => ['...', type(n.typeAnnotation)],
-  TSLiteralType: (n, ctx) => print(n.literal, ctx),
+  TSLiteralType: (n) => print(n.literal, { noCast: true }),
   TSTemplateLiteralType: (n) => template(n.quasis, n.types, (t) => type(t)),
   TSTypeQuery: (n, ctx) => ['typeof ', print(n.exprName, ctx), typeArgs(n.typeArguments, ctx)],
   TSImportType: (n, ctx) => [
     'import',
     list(n.options ? [n.source, n.options] : [n.source], ctx, nodeItem, { open: '(', close: ')' }),
-    n.qualifier ? ['.', print(n.qualifier, ctx)] : '',
+    n.qualifier ? dot('.', n.qualifier, ctx) : '',
     typeArgs(n.typeArguments, ctx),
   ],
   TSTypePredicate(n, ctx) {
+    sameLineChild(n, 'parameterName')
     const s: Doc = [n.asserts ? 'asserts ' : '', print(n.parameterName, ctx)]
-    return n.typeAnnotation ? [s, ' is ', lead(n.typeAnnotation), returnType(n.typeAnnotation)] : s
+    const t = n.typeAnnotation
+    return t ? [s, ' is ', withComments(t.comments ?? [], returnType(t))] : s
   },
 }
 
 for (const [name, word] of Object.entries(KEYWORDS)) PRINTERS[name] = () => word
 
+/**
+ * `.name`. A line comment on the name goes before the dot, `a // c` newline
+ * `.b`: TS reads `a.` newline `b as T` as a missing name (its recovery for `a.`
+ * left before a declaration).
+ */
+function dot(op: string, name: N, ctx: Ctx): Doc {
+  if (!hasLineComment(name.comments ?? [])) return [op, print(name, ctx)]
+  return [' ', withComments(name.comments, [op, print(name, ctx, false)])]
+}
+
+/** ` label` of `break`/`continue`. */
+function label(n: N, ctx: Ctx): Doc {
+  sameLineChild(n, 'label')
+  return n.label ? [' ', print(n.label, ctx)] : ''
+}
+
 /** A TSTypeAnnotation printed without `: ` (after `=>`, `is`); marked as itself. */
 const returnType = (n: N): Doc => mark(n, type(n.typeAnnotation))
 
 /** ` => R` of a function type; the annotation starts at `=>`, so its comments go before it. */
-const arrowReturn = (n: N): Doc => [hasLead(n) ? [' ', lead(n), '=> '] : ' => ', returnType(n)]
+const arrowReturn = (n: N): Doc => (hasLead(n) ? [' ', withComments(n.comments, ['=> ', returnType(n)])] : [' => ', returnType(n)])
 
 /** `a as a` is just `a`, unless a comment sits on one of them. */
 const sameName = (a: N, ad: Doc, b: N, bd: Doc) => !hasLead(a) && !hasLead(b) && text(ad) === text(bd)
 
 function property(n: N, ctx: Ctx): Doc {
   const accessor = n.type === 'AccessorProperty' || n.type === 'TSAbstractAccessorProperty' ? 'accessor ' : ''
+  sameLineChild(n, 'key')
   const s: Doc = [
     decorators(n.decorators, ctx),
     modifiers(n),

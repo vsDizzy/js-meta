@@ -3,6 +3,7 @@ import { describe, test } from 'node:test'
 import { emit, emitWithMap } from '../emit/index.ts'
 import { walk } from '../ast/walk.ts'
 import { read } from '../read/index.ts'
+import type { Node } from '../ast/node.ts'
 import { js, match, rule, rules } from './index.ts'
 
 const print = (n: unknown): string => (Array.isArray(n) ? n.map(print).join('\n') : emit(n as never).trimEnd())
@@ -101,7 +102,7 @@ describe('match', () => {
     assert.deepEqual(match(js`f()`, js`f($$args)`), { args: [] })
     const body = match(js.stmt`function g(a) { /* c */ log(a); return a }`, js.stmt`function $name($$params) { $$body; return $r }`)!
     assert.equal(print(body.name), 'g')
-    assert.equal(print(body.body), 'log(a)')
+    assert.equal(print(body.body), '/* c */\nlog(a)', 'a run carries its comments')
     assert.equal(match(js.stmts`a(); b()`, js.stmts`$$_; b()`) !== null, true)
   })
 
@@ -112,10 +113,10 @@ describe('match', () => {
     assert.equal(print(match(js`o.prop`, js`o.$p`)!.p), 'prop')
   })
 
-  test('leading comments are ignored, on either side', () => {
+  test('comments in the target are ignored; a comment in the pattern is required', () => {
     assert.equal(print(match(read('x = /* @__PURE__ */ f(1)').body[0], js`x = f($a)`)!.a), '1')
-    assert.ok(match(js`f(1)`, js`/* any */ f($a)`))
     assert.ok(match(read('if (/* c */ a) b()').body[0], js`if (a) $_`))
+    assert.equal(match(js`f(1)`, js`/* any */ f($a)`), null)
   })
 
   test('expression patterns match expression statements; declarations match expressions', () => {
@@ -181,5 +182,173 @@ describe('rule', () => {
   test('mistakes: an uncaptured variable, a rule that never settles', () => {
     assert.throws(() => walk(read('f(1)'), rule(js`f($a)`, js`g($b)`)), /\$b in a replacement is not captured/)
     assert.throws(() => walk(read('f(1)'), rule(js`f($a)`, js`f(f($a))`)) && 0, /keep firing/)
+  })
+})
+
+/** Matches the `i`th statement of `src`, with the context that gives the comments before it. */
+const matchAt = (src: string, i: number, pattern: Node) => {
+  const ast = read(src)
+  return match(ast.body[i], pattern, { parent: ast, key: 'body', index: i })
+}
+const values = (cs: any[]) => cs.map((c) => c.value)
+
+// Templates are read from their raw text, so line breaks in them are written out.
+describe('comments: js', () => {
+  test('comments around the root go in front of it', () => {
+    assert.deepEqual(values(js`/* a */ f()`.comments as any[]), [' a '])
+    assert.deepEqual(values(js`// a
+      f() // b`.comments as any[]), [' a', ' b'])
+    const s = js.stmt`/** doc */ function f() {}`
+    assert.equal(s.type, 'FunctionDeclaration')
+    assert.deepEqual(values(s.comments as any[]), ['* doc '])
+    assert.deepEqual(js.stmts`/* a */ f()`.map((n) => n.type), ['Comment', 'ExpressionStatement'], 'in a list they stay siblings')
+  })
+
+  test('a value put in a list brings its comments as siblings, as read gives them', () => {
+    const note = js.stmt`// note
+      f()`
+    const body = js.stmts`${note}; ${js`/* c */ g()`}`
+    assert.deepEqual(body.map((n) => n.type), ['Comment', 'ExpressionStatement', 'Comment', 'ExpressionStatement'])
+    assert.equal(print(body), '// note\nf()\n/* c */\ng()')
+    const same = (a: unknown, b: unknown) => assert.equal(JSON.stringify(a), JSON.stringify(b))
+    same(body, read(print(body)).body)
+    assert.equal(print(js`g(${js`/* c */ a`})`), 'g(/* c */ a)')
+    same(js`g(${js`/* c */ a`})`, (read('g(/* c */ a)').body[0] as any).expression)
+    assert.equal(print(js`if (a) ${js`/* c */ f()`}`), 'if (a) /* c */ f()', 'elsewhere the statement leads with them')
+  })
+
+  test('a comment that is just a hole stands for comments', () => {
+    const [hi, there] = read('/* hi */ /* there */ x').body
+    assert.equal(print(js`x = /* ${hi} */ f()`), 'x = /* hi */ f()')
+    assert.equal(print(js`f(/* ${[hi, there]} */ a, /* ${[]} */ b)`), 'f(/* hi */ /* there */ a, b)')
+    assert.equal(print(js`f(${[hi, js`a`]})`), 'f(/* hi */ a)', 'a comment in an array stays a comment in a list')
+    assert.throws(() => js`/* see ${1} */ f()`, /a \$\{\} inside a comment/)
+    assert.throws(() => js`/* ${1} */ f()`, /\$\{\} #1 .* stands for a comment, but it is number/)
+    assert.throws(() => js`x = ${hi}`, /is a Comment: it goes in a list/)
+  })
+})
+
+describe('comments: match', () => {
+  const pure = js`x = /* @__PURE__ */ $call`
+  test('a literal comment: same kind and trimmed text, among others', () => {
+    assert.equal(print(match(read('x = /*@__PURE__*/ f()').body[0], pure)!.call), '/*@__PURE__*/ f()')
+    assert.ok(match(read('x = /* a */ /* @__PURE__ */ f()').body[0], pure))
+    assert.equal(match(read('x = f()').body[0], pure), null)
+    assert.equal(match(read('x = /* other */ f()').body[0], pure), null)
+    const note = js`// note
+      f()`
+    assert.ok(matchAt('// note\nf()', 1, note))
+    assert.equal(matchAt('/* note */ f()', 1, note), null, 'Line and Block differ')
+  })
+
+  test('variables: /* $c */ any one, /** $doc */ JSDoc only, /* $$cs */ all', () => {
+    assert.equal(match(read('x = /* hi */ f()').body[0], js`x = /* $c */ $_`)!.c.value, ' hi ')
+    assert.equal(matchAt('// hi\nf()', 1, js`/* $c */ f()`)!.c.kind, 'Line', 'a variable takes any kind')
+    assert.equal(match(read('x = f()').body[0], js`x = /* $c */ $_`), null)
+    assert.equal(match(read('x = /* no */ f()').body[0], js`x = /** $doc */ $_`), null)
+    assert.equal(match(read('x = /* no */ /** yes */ f()').body[0], js`x = /** $doc */ $_`)!.doc.value, '* yes ')
+    assert.deepEqual(values(match(read('x = /* a */ /* b */ f()').body[0], js`x = /* $$cs */ $_`)!.cs), [' a ', ' b '])
+    assert.deepEqual(match(read('x = f()').body[0], js`x = /* $$cs */ $_`)!.cs, [])
+    assert.deepEqual(match(read('x = /* a */ f()').body[0], js`x = /* $_ */ /* $$_ */ $_`), {})
+  })
+
+  test('several: in order; a $$ variable takes its gap', () => {
+    const ab = js`x = /* a */ /* b */ $_`
+    assert.ok(match(read('x = /* a */ /* z */ /* b */ f()').body[0], ab))
+    assert.equal(match(read('x = /* b */ /* a */ f()').body[0], ab), null)
+    const m = match(read('x = /* p */ /* @__PURE__ */ /* q */ /* r */ f()').body[0], js`x = /* $$pre */ /* @__PURE__ */ /* $$post */ $_`)!
+    assert.deepEqual([values(m.pre), values(m.post)], [[' p '], [' q ', ' r ']])
+    assert.ok(match(read('x = /* a */ f(/* a */ 1)').body[0], js`x = /* $c */ f(/* $c */ $_)`), 'a repeated comment must be equal')
+    assert.equal(match(read('x = /* a */ f(/* b */ 1)').body[0], js`x = /* $c */ f(/* $c */ $_)`), null)
+  })
+
+  test('in lists: before an element, and at the end', () => {
+    assert.ok(match(js`f(/* a */ x, y)`, js`f(/* a */ $x, $y)`))
+    assert.equal(match(js`f(x, /* a */ y)`, js`f(/* a */ $x, $y)`), null)
+    const end = read('{\n  f()\n  // end\n}').body[0]
+    assert.ok(match(read('{\n  f()\n  // other\n  // end\n}').body[0], end))
+    assert.equal(match(read('{ f() }').body[0], end), null)
+    assert.equal(match(read('{\n  // end\n  f()\n}').body[0], end), null, 'in front of an element is not at the end')
+  })
+
+  test('at the root, the comments before the node in its list come from the context', () => {
+    const doc = js`/** $doc */ function $f() {}`
+    const fn = read('/** Does f. */\nfunction f() {}').body[1]
+    assert.equal(match(fn, doc), null, 'the node alone has no comments')
+    assert.equal(matchAt('/** Does f. */\nfunction f() {}', 1, doc)!.doc.value, '* Does f. ')
+    assert.equal(match(fn, doc, { before: [read('/** Other. */ x').body[0]] })!.doc.value, '* Other. ')
+    const found: string[] = []
+    walk(read('/** One. */\nfunction one() {}\nfunction two() {}'), (node, ctx) => {
+      const m = match(node, doc, ctx)
+      if (m) found.push(m.f.name)
+    })
+    assert.deepEqual(found, ['one'])
+    // An expression pattern on its statement: the comment is the statement's sibling.
+    assert.ok(matchAt('/* @__PURE__ */ f()', 1, js`/* @__PURE__ */ f()`))
+    assert.ok(match(read('(/* @__PURE__ */ f())').body[0], js`/* @__PURE__ */ f()`))
+  })
+})
+
+describe('comments: $$ runs', () => {
+  const block = (m: any, name: string) => print(m[name])
+  test('a run is the slice of the list, comments included', () => {
+    const src = read('{\n  /* a */ x()\n  // b\n  y()\n  // end\n}').body[0]
+    const all = match(src, js.stmt`{ $$body }`)!
+    assert.equal(block(all, 'body'), '/* a */\nx()\n// b\ny()\n// end', 'a last run takes the trailing comments')
+    const split = match(src, js.stmt`{ $$init; $last }`)!
+    assert.equal(block(split, 'init'), '/* a */\nx()', 'the comments in front of $last are its own')
+    assert.equal(block(split, 'last'), 'y()')
+    const front = match(src, js.stmt`{ $$init; /* $$c */ $last }`)!
+    assert.deepEqual(values(front.c), [' b'])
+    const end = match(src, js.stmt`{ $$body
+      /* $$end */
+    }`)!
+    assert.deepEqual([block(end, 'body'), values(end.end)], ['/* a */\nx()\n// b\ny()', [' end']])
+  })
+
+  test('a repeated run compares code only', () => {
+    assert.ok(match(js`f([/* c */ 1, 2], [1, 2])`, js`f([$$a], [$$a])`))
+  })
+
+  test('a rule { $$body } -> { $$body } keeps the comments', () => {
+    const toArrow = rule(js`function $f($$p) { $$body }`, js`const $f = ($$p) => { $$body }`)
+    const out = walk(read('function f(a) {\n  // first\n  a()\n  /* x */ b()\n  // end\n}'), toArrow)!
+    assert.equal(print(out), 'const f = (a) => {\n  // first\n  a()\n  /* x */\n  b()\n  // end\n}')
+  })
+})
+
+describe('comments: replacements', () => {
+  test('/* $c */ puts the captured comment, /* $$cs */ the captured ones; literal comments stay', () => {
+    const swap = rule(js`swap(/* $c */ $a, /* $$cs */ $b)`, js`[/* $$cs */ $b, /* $c */ /* literal */ $a]`)
+    assert.equal(print(walk(read('x = swap(/* one */ a, /* two */ /* three */ b)'), swap)), 'x = [/* two */ /* three */ b, /* one */ /* literal */ a]')
+    const lead = rule(js`f(/* $c */ $a)`, js`g(/* $c */ $a, /* $c */ $a)`)
+    assert.equal(print(walk(read('f(/* c */ 1)'), lead)), 'g(/* c */ 1, /* c */ 1)')
+    assert.throws(() => walk(read('x = /* c */ f()'), rule(js`x = /* $c */ $f`, js`x = /* $f */ 1`)), /\$f .* stands for a comment, but it is a CallExpression/)
+  })
+
+  test('a rule that adds /* @__PURE__ */ in front of calls, round-tripping through emit', () => {
+    const isPure = (c: any) => c.value.trim() === '@__PURE__'
+    const pure = rule(js`/* $$cs */ h($$args)`, (m) => (m.cs.some(isPure) ? undefined : js`/* ${m.cs} */ /* @__PURE__ */ h(${m.args})`))
+    const out = walk(read('const a = h(1)\nconst b = /* why */ h(2, /* x */ 3)\nconst c = /* @__PURE__ */ h(4)\nh(5)'), pure)!
+    const code = emit(out)
+    assert.equal(code.trimEnd(), 'const a = /* @__PURE__ */ h(1)\nconst b = /* why */ /* @__PURE__ */ h(2, /* x */ 3)\nconst c = /* @__PURE__ */ h(4)\n;(/* @__PURE__ */ h(5))')
+    assert.equal(emit(read(code)), code)
+  })
+
+  test('a JSDoc comment captured and moved', () => {
+    const toFunction = rule(js.stmt`const $f = /** $doc */ ($$params) => $body`, js.stmt`/** $doc */ function $f($$params) { return $body }`)
+    const code = emit(walk(read('const add = /** Adds. */ (a, b) => a + b'), toFunction)!)
+    assert.equal(code.trimEnd(), '/** Adds. */ function add(a, b) {\n  return a + b\n}')
+    const back = read(code)
+    const m = match(back.body[1], js`/** $doc */ function $f($$p) { $$body }`, { before: [back.body[0]] })!
+    assert.deepEqual([m.doc.value, m.f.name], ['* Adds. ', 'add'])
+  })
+
+  test('comments before the node in its list stay there, once', () => {
+    const toConst = rule(js`/** $doc */ function $f($$p) { $$body }`, js`/** $doc */ const $f = ($$p) => { $$body }`)
+    const out = walk(read('/** Does f. */\nfunction f() {}\nfunction g() {}'), toConst)!
+    assert.equal(print(out), '/** Does f. */\nconst f = () => {}\n\nfunction g() {}', 'only a function with JSDoc changes')
+    const keep = rule(js`/* $$cs */ f($a)`, js`/* $$cs */ g($a)`)
+    assert.equal(print(walk(read('/* keep */ f(1)\nx = /* why */ f(2)'), keep)), '/* keep */\ng(1)\nx = /* why */ g(2)')
   })
 })

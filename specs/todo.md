@@ -8,21 +8,18 @@ Future work, not scheduled. Each item says what is wanted and, where known, how 
 
 **Where it stands (2026-11-20):**
 - Comments in lists are `Comment` nodes and `walk` visits them.
-- Block comments in non-list positions are leading comments of the node after them (its `comments` attribute). `walk` visits those too (`ctx.key === 'comments'`, `ctx.parent` is the owner), and a replacement inherits them.
+- Comments in non-list positions, block and line, are leading comments of the node after them (its `comments` attribute). `walk` visits those too, and a replacement inherits them.
+- `match` and `rule` see comments when the pattern asks for them, `$$a` runs carry their comments, and templates can generate comments.
+- A JSDoc cast `/** @type {T} */ (x)` keeps its parentheses.
 - Live redefinition ignores comments when it compares forms.
 
 **Still skipped:**
-1. **`match` and `rule` ignore comments.** A pattern cannot say "a call with a `/* @__PURE__ */` in front" or "a function with a JSDoc before it".
-2. **Line comments in non-list positions are still hoisted** (`a + // why` then `b` on the next line).
-3. **Parentheses are not kept**, so a JSDoc cast `/** @type {T} */ (x)` loses the parentheses that make it a cast.
-
-**How it could be built:**
-1. Patterns: keep "comments are ignored" as the default and add an explicit way to ask for them. Options: a comment in the pattern text becomes a requirement (`` js`/* $c */ $call` `` captures the comment node as `c`), or a predicate once patterns have predicates. For a JSDoc before a list element, a pattern over the list (`$$before`, comment, element) already fits the `$$` machinery.
-2. Line comments in place: the printer needs a "must break the line after this" Doc, and has to refuse or re-place them after `return`, `throw`, `break`, `continue`, `yield` and before a postfix operator, where a newline changes the meaning.
-3. Parentheses: a `parenthesized` attribute would make `a+b` and `(a+b)` different trees. Cheaper: keep them only when a leading comment starts with `* @type` or `* @satisfies`, decided at print time from the AST.
+1. **A rule cannot remove or move a comment that is a list sibling before its node.** `walk` replaces only the node, so `/** doc */` before a function stays where it is. A replacement that puts such a comment back in front of its root is not doubled, but one that puts it anywhere else makes a copy. Fix: let a `walk` handler replace the comments before a node (or return a run of list elements for a run).
+2. **A template rule that only adds a comment never settles.** `h($$a)` → `/* @__PURE__ */ h($$a)` matches its own output, because a pattern without comments ignores them. Today: a function replacement that passes when the comment is there. Fix: a way to say "no comment here" in a pattern (a predicate, once patterns have them).
+3. **Comment matching does not backtrack across nodes.** A repeated comment variable (`/* $c */ … /* $c */`) takes the earliest fit in each place.
+4. **A statement with a line comment in its `comments` attribute** (a `js.stmt` root printed on its own) prints as `// note`, then the statement indented as a continuation. Leading comments of a statement could print on their own lines.
 
 ## Known gaps in comment round trips
 
-Found on 2026-11-20, older than leading comments:
-- `(/* c */ a), b`: the comment goes into the sequence's list and prints at the start of the statement; neither round-trip property holds.
-- `import x, /* c */ * as ns from 'x'`: the ImportDeclaration printer drops a comment between the default and namespace specifiers.
+- `class A { @dec /* c */ m() {} }`: a comment after a decorator prints in front of `@`, where it reads back as a class-body comment.
+- A JSDoc cast with a line break before the parenthesis (`/** @type {T} */`, new line, `(x).foo()`) is read as a list comment and loses its parentheses. See the decision log for why the cast rule needs the same line.
