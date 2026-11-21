@@ -233,3 +233,46 @@ Differences from the design, found while building it.
 - **Chosen:** a rule's replacement template may hold `pat/` nodes; they are filled by `build` after `substitute`. Before, they were left in the result without an error.
 - **Chosen:** `ctx.freshName(base)`. `freshName(base, ctx.scope.names)` gives the same name twice in one walk, because the scope is a snapshot.
 
+
+## 2026-11-21
+
+### SystemJS does not replace our module runtime
+
+Confirms "Own module format and runtime" (2026-11-19).
+
+- **Rejected:** SystemJS 6 as the module system. It loads `System.register`, not ESM source, so `read` and `lower` stay and only the graph loading and evaluation order in `runtime.ts` would go. Its `instantiate` hook is async but resolves to a registration (`[deps, declare]`), neither text nor an AST; the documented place for a transform is the `fetch` hook, text to text. The AST would live in a table of our own beside it, which is what `records` are. It has no public way to list a module's importers, no redefinition per top-level form and no `eval` inside a module.
+- **Rejected:** starting as a native ES module that later mirrors into our runtime. A native module instance cannot be redefined (the reason `blob:` URLs were rejected).
+
+### Other languages are in the icebox; the two-layer matcher stays
+
+- **Chosen:** js-meta does one thing, a homoiconic runtime for JavaScript (with types as far as ESTree and JSDoc carry them). Readers, printers and rule sets for cljs, Lisp and Lua are frozen, maybe for good: nothing new is built for them.
+- **Chosen:** the pattern core (`src/match/`) and node families stay as built. JS uses them itself: `pat/` nodes are a family, `p.or` / `p.not` / `p.guard` / partial `p.node` have no form in the `js` sugar, and rules look up by kind and head through the family tables.
+- **Chosen:** the acceptance rule sets for other languages stay as tests of the core's generality. Delete one when it blocks a change to the core, not before.
+- **Rejected:** folding the core back into `match`. It would remove about 110 lines of family tables and give back a matcher that knows ESTree by name, while every `pat/` feature would need its own JS syntax.
+
+### TypeScript as erasable syntax, not as semantics
+
+Extends "`read` keeps TS types" (2026-11-18).
+
+- **Chosen:** our loader takes `.ts` modules like `.js` ones: read, macros, live redefinition, `eval`. Types are syntax that is erased before execution. The limit is erasable syntax, as in `erasableSyntaxOnly` and Node: `enum`, `namespace` with values and parameter properties are an error with a clear message.
+- **Rejected:** type semantics (checking, inference). It needs a type checker on the page and is a project of its own. A macro sees the type that is written, not the one that is inferred.
+- **Why now:** a `.ts` module was a native import wrapped as a record, with no AST, no macros and no redefinition, so the live part of the runtime was for `.js` only.
+
+### Text transformations are async, code transformations are live
+
+- **Chosen:** anything that turns text into text is async, so it can later become a fetch or a call to a worker or service worker. Anything that works on code works on the AST in the page's memory, synchronously, on the tree the record keeps.
+- **Consequence:** the loader has two stages with `read` between them. Before it, async, text only. After it, sync, trees only.
+
+### Type erasure is a pass on the AST
+
+- **Chosen:** types are erased by a sync pass on the tree, in the lowering step: `read` → macros → erase → `lower` → `emit`. `records[url].ast` is the typed tree the user wrote, so macros see types, one source map points into the `.ts` file, and `redefine` / `eval` take TS text as it is.
+- **Chosen:** only explicit `import type` / `export type` and `type` specifiers are removed, as in Node. An import used only as a type but written without `type` stays an import.
+- **Rejected as the main path:** lowering TS to JS with TypeScript (`ts.transpileModule`) before `read`. The record's AST would be the transpiled JS, not the file; macros would not see types; the source map would need composing; every `redefine` / `eval` input would need the same step. It can be a plugin of the async text stage later, for syntax that cannot be erased.
+- **Chosen:** ts-code hands the raw `.ts` to a `fetch()` and transpiles only module requests (`request.destination === 'script'`). js-meta needs no flag and knows nothing about ts-code; ts-code still transpiles js-meta's own sources.
+- **Rejected:** a `?raw` query or a request header. The browser already tells "import this module" from "read this file".
+
+### Library modules stay native
+
+- **Chosen:** a library is never read into an AST. Bare specifiers and other origins (esm.sh) are native imports wrapped as records, as before; with `.ts` joining the loader, same-origin paths under `/node_modules/` are native by default too. `isSource` remains the override.
+- **Rejected:** reading everything the page imports. A library has no forms the user redefines and no macros to expand, and parsing megabytes (TypeScript itself is about 9 MB) costs time and memory on every load.
+- **Accepted cost:** a native module has no AST, no `redefine` and no `eval`. If a native module imports one of our modules, the browser loads a second, native instance of it; libraries do not import application code, so this is left alone.
